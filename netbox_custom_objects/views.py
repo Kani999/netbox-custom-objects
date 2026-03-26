@@ -851,7 +851,7 @@ class CustomObjectJournalView(ConditionalLoginRequiredMixin, View):
         )
 
         journal_table = JournalEntryTable(
-            data=journal_entries, orderable=False, user=request.user
+            data=journal_entries, orderable=False
         )
         journal_table.configure(request)
         journal_table.columns.hide("assigned_object_type")
@@ -881,7 +881,7 @@ class CustomObjectJournalView(ConditionalLoginRequiredMixin, View):
                 "form": form,
                 "table": journal_table,
                 "base_template": self.base_template,
-                "tab": "journal",
+                "tab": self.tab,
                 "form_action": reverse(
                     "plugins:netbox_custom_objects:custom_journalentry_add"
                 ),
@@ -923,7 +923,7 @@ class CustomObjectChangeLogView(ConditionalLoginRequiredMixin, View):
         )
 
         objectchanges_table = ObjectChangeTable(
-            data=objectchanges, orderable=False, user=request.user
+            data=objectchanges, orderable=False
         )
         objectchanges_table.configure(request)
 
@@ -938,6 +938,6 @@ class CustomObjectChangeLogView(ConditionalLoginRequiredMixin, View):
                 "object": obj,
                 "table": objectchanges_table,
                 "base_template": self.base_template,
-                "tab": "changelog",
+                "tab": self.tab,
             },
         )
