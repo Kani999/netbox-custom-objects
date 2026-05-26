@@ -423,10 +423,15 @@ def register_typed_tabs(model_classes, weight):
         # is_polymorphic is immutable upstream but related_object_type isn't
         # nulled when toggled) would otherwise hit both querysets. _record's
         # seen_field_keys stays as defence in depth.
+        #
+        # custom_object_type__show_dedicated_tab=True is the per-COT opt-in
+        # gate for typed tabs.  Combined tabs do not depend on this flag —
+        # they are registered for every referenced model regardless.
         non_poly_fields = list(
             CustomObjectTypeField.objects.filter(
                 is_polymorphic=False,
                 type__in=type_choices,
+                custom_object_type__show_dedicated_tab=True,
             ).select_related('custom_object_type')
         )
 
@@ -437,6 +442,7 @@ def register_typed_tabs(model_classes, weight):
             CustomObjectTypeField.objects.filter(
                 is_polymorphic=True,
                 type__in=type_choices,
+                custom_object_type__show_dedicated_tab=True,
             )
             .select_related('custom_object_type')
             .prefetch_related('related_object_types')

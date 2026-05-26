@@ -9,6 +9,7 @@ from utilities.forms.fields import (CommentField, ContentTypeChoiceField,
                                     DynamicModelChoiceField, SlugField, TagFilterField)
 from utilities.forms.rendering import FieldSet
 from utilities.forms.utils import get_field_value
+from utilities.forms.widgets import BulkEditNullBooleanSelect
 from utilities.object_types import object_type_name
 
 from netbox_custom_objects.choices import SearchWeightChoices
@@ -59,7 +60,7 @@ class CustomObjectTypeForm(NetBoxModelForm):
     fieldsets = (
         FieldSet(
             "name", "verbose_name", "verbose_name_plural", "slug",
-            "version", "description", "group_name", "tags",
+            "version", "description", "group_name", "show_dedicated_tab", "tags",
         ),
     )
     comments = CommentField()
@@ -68,7 +69,7 @@ class CustomObjectTypeForm(NetBoxModelForm):
         model = CustomObjectType
         fields = (
             "name", "verbose_name", "verbose_name_plural", "slug", "version", "description",
-            "group_name", "comments", "tags",
+            "group_name", "show_dedicated_tab", "comments", "tags",
         )
 
 
@@ -76,10 +77,19 @@ class CustomObjectTypeBulkEditForm(NetBoxModelBulkEditForm):
     description = forms.CharField(
         label=_("Description"), max_length=200, required=False
     )
+    # NullBooleanField + BulkEditNullBooleanSelect is required for tri-state bulk-edit
+    # of a non-nullable BooleanField: unset (no change) / True / False.  A plain
+    # BooleanField would only submit True or, when unchecked, omit the value
+    # entirely, making it impossible to bulk-set show_dedicated_tab=False.
+    show_dedicated_tab = forms.NullBooleanField(
+        label=_("Dedicated tab"),
+        required=False,
+        widget=BulkEditNullBooleanSelect(),
+    )
     comments = CommentField()
 
     model = CustomObjectType
-    fieldsets = (FieldSet("description"),)
+    fieldsets = (FieldSet("description", "show_dedicated_tab"),)
     nullable_fields = (
         "description",
         "comments",
@@ -95,6 +105,7 @@ class CustomObjectTypeImportForm(NetBoxModelImportForm):
             "slug",
             "description",
             "comments",
+            "show_dedicated_tab",
             "tags",
         )
 

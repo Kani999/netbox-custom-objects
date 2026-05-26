@@ -38,6 +38,10 @@
             <td>{{ object.description|placeholder }}</td>
           </tr>
           <tr>
+            <th scope="row">{% trans "Dedicated tab" %}</th>
+            <td>{% checkmark object.show_dedicated_tab %}</td>
+          </tr>
+          <tr>
             <th scope="row">{% trans "Last activity" %}</th>
             <td>
               {{ latest_change.time|isodatetime|placeholder }}

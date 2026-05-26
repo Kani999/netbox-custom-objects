@@ -62,6 +62,9 @@ class CustomObjectTypeTable(NetBoxTable):
         verbose_name=_('Name'),
         linkify=True
     )
+    show_dedicated_tab = columns.BooleanColumn(
+        verbose_name=_('Dedicated tab'),
+    )
 
     class Meta(NetBoxTable.Meta):
         model = CustomObjectType
@@ -73,6 +76,7 @@ class CustomObjectTypeTable(NetBoxTable):
             "verbose_name_plural",
             "slug",
             'description',
+            'show_dedicated_tab',
             'comments',
             'tags',
             "created",

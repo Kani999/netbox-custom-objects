@@ -258,6 +258,14 @@ class CustomObjectType(NetBoxModel):
         blank=True,
         help_text=_("Used to group similar custom object types in the navigation menu")
     )
+    show_dedicated_tab = models.BooleanField(
+        default=False,
+        help_text=_(
+            "If enabled, render a per-type tab on detail pages of every NetBox object this "
+            "Custom Object Type references. Otherwise, references are aggregated under a "
+            "single combined \"Custom Objects\" tab."
+        ),
+    )
     schema_document = models.JSONField(
         blank=True,
         null=True,
