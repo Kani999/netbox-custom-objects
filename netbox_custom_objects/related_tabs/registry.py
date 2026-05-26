@@ -266,6 +266,105 @@ def _purge_injected_urls():
     ]
 
 
+def _inject_host_typed_tab_urls():
+    """
+    Sync URL patterns for built-in / third-party host apps after a hot-reload
+    re-registration.
+
+    At startup, each NetBox app's ``urls.py`` calls
+    ``include(get_model_urls(app, model))`` for its models — capturing a list
+    of URL patterns reflecting the registry state at that moment.  The
+    captured list is the ``urlconf_module`` attribute of the resulting
+    ``URLResolver``, and Django's URL resolver tree references it directly
+    via ``URLResolver.url_patterns`` (a cached property that returns the
+    same list reference each call).
+
+    When a CustomObjectType / CustomObjectTypeField mutation triggers
+    ``_do_refresh()``, the registry gains or loses typed-tab entries — but
+    the captured lists are stale: ``get_model_urls()`` was called only once
+    at module load.  This function rebuilds them in-place:
+
+    1. Walk every app whose registry slot has at least one of our tab
+       entries (skipping the ``netbox_custom_objects`` app — its typed tabs
+       on dynamic CO models are handled by ``_inject_co_urls()`` instead,
+       because the host plugin's ``urls.py`` doesn't go through
+       ``get_model_urls()`` for them).
+    2. Import the host app's ``urls`` module and find the URLResolver whose
+       inner list contains the detail-view marker entry (name == model_name,
+       which is what ``get_model_urls()`` produces for the detail view).
+    3. Call ``get_model_urls()`` afresh — this reads the current registry
+       state and produces a new list of URL patterns including the typed
+       tabs we just registered.
+    4. Replace the captured list's contents in-place via
+       ``captured[:] = fresh``.  Slice-assignment keeps the same list
+       reference, so the URLResolver's cached ``url_patterns`` keeps
+       working with no cache invalidation needed.
+
+    Caller (``_do_refresh``) follows with ``clear_url_caches()`` so Django
+    rebuilds its resolver lookup tables against the new patterns.
+    """
+    from importlib import import_module
+
+    from django.urls.resolvers import URLResolver
+    from netbox.registry import registry
+    from utilities.urls import get_model_urls
+
+    # Collect (app_label, model_name) pairs where we have ANY tab entry
+    # (combined or typed).  Combined-tab URLs are produced the same way and
+    # benefit equally from this refresh (e.g. a brand-new host model that
+    # only became a target during this refresh).
+    host_keys = set()
+    for app_label, model_map in registry['views'].items():
+        if app_label == _CUSTOM_OBJECTS_APP:
+            continue
+        for model_name, entries in model_map.items():
+            if any(_is_our_tab_name(e['name']) for e in entries):
+                host_keys.add((app_label, model_name))
+
+    for app_label, model_name in host_keys:
+        try:
+            urls_mod = import_module(f'{app_label}.urls')
+        except ImportError:
+            logger.debug('host app %s has no urls module - skipping URL injection', app_label)
+            continue
+
+        urlpatterns = getattr(urls_mod, 'urlpatterns', None)
+        if not urlpatterns:
+            continue
+
+        captured = None
+        for p in urlpatterns:
+            if not isinstance(p, URLResolver):
+                continue
+            inner = p.urlconf_module
+            if not isinstance(inner, list):
+                # Could be a module reference (rare).  We can't safely
+                # mutate a module's urlpatterns from here, so skip.
+                continue
+            # Detail-view marker: get_model_urls() emits the detail view with
+            # name == model_name (no suffix); any other URL has model_name as
+            # a prefix.
+            if any(getattr(sp, 'name', None) == model_name for sp in inner):
+                captured = inner
+                break
+
+        if captured is None:
+            logger.debug('no captured get_model_urls list found for %s.%s', app_label, model_name)
+            continue
+
+        try:
+            fresh = get_model_urls(app_label, model_name, detail=True)
+        except Exception:
+            logger.exception('get_model_urls failed for %s.%s during hot-reload', app_label, model_name)
+            continue
+
+        # Slice-assignment preserves the captured list's identity so the
+        # URLResolver's cached `url_patterns` keeps pointing at the right
+        # object — only the contents change.
+        captured[:] = fresh
+        logger.debug('refreshed %d URL patterns for %s.%s', len(fresh), app_label, model_name)
+
+
 def _do_refresh():
     """
     Tear-down + re-register the entire tab registry.
@@ -274,10 +373,22 @@ def _do_refresh():
     in ``netbox_custom_objects.related_tabs``.  The caller is responsible for
     serialising calls (the module-level RLock) and for updating the local
     version counter afterwards.
+
+    Order matters:
+    1. Purge our existing entries from the registry and our injected URLs
+       so a stale typed tab (e.g. for a deleted COT) doesn't survive.
+    2. Re-register from the current DB state.
+    3. Inject typed-tab URLs into built-in host apps' captured URL conf
+       lists (these were snapshotted at startup; without this step,
+       reverse() on newly-registered typed-tab URLs would fail and
+       clicking the tab in the UI 404s).
+    4. ``clear_url_caches()`` so Django re-resolves against the patched
+       resolver tree on the next request.
     """
     from django.urls import clear_url_caches
 
     _purge_tab_entries()
     _purge_injected_urls()
     register_tabs()
+    _inject_host_typed_tab_urls()
     clear_url_caches()
