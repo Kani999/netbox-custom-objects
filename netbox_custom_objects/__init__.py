@@ -296,6 +296,15 @@ class CustomObjectsPluginConfig(PluginConfig):
         from django.apps import apps as django_apps
         django_apps.clear_cache()
 
+        try:
+            from netbox_custom_objects.related_tabs.registry import register_tabs
+            register_tabs()
+        except Exception:
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).exception(
+                "related_tabs.register_tabs() failed; continuing without tabs"
+            )
+
         super().ready()
 
     def get_model(self, model_name, require_ready=True):

@@ -1,88 +1,10 @@
 import logging
 
-from django.apps import apps
-from netbox.plugins import get_plugin_config
-
 from .views._co_common import _CUSTOM_OBJECTS_APP
 from .views.combined import register_combined_tabs
 from .views.typed import register_typed_tabs
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
-
-
-def _resolve_dynamic_custom_object_models():
-    """
-    Return all dynamically-generated Custom Object model classes from the Django app registry.
-
-    netbox_custom_objects.ready() runs before ours (it has a lower INSTALLED_APPS index) and
-    registers all dynamic per-type models.  We read them directly from the registry rather than
-    calling CustomObjectType.get_model() again — each get_model() call that misses the cache
-    re-registers journal/changelog views, producing duplicate tabs.
-
-    A restart is required whenever a new Custom Object Type is added.
-    """
-    try:
-        from netbox_custom_objects.models import CustomObject
-    except ImportError:
-        logger.warning('netbox_custom_objects plugin not installed — skipping')
-        return []
-
-    try:
-        app_config = apps.get_app_config(_CUSTOM_OBJECTS_APP)
-    except LookupError:
-        logger.warning('netbox_custom_objects app not found — skipping')
-        return []
-
-    # Filter to dynamic CO models only (subclasses of CustomObject, not CustomObject itself).
-    return [m for m in app_config.get_models() if issubclass(m, CustomObject) and m is not CustomObject]
-
-
-def _resolve_model_labels(labels):
-    """
-    Resolve a list of model label strings (e.g. ["dcim.*", "ipam.device"])
-    into a deduplicated list of Django model classes.
-
-    The special wildcard ``netbox_custom_objects.*`` resolves to all dynamically-
-    generated Custom Object models (one per CustomObjectType row).  A NetBox
-    restart is required whenever a new Custom Object Type is added.
-    """
-    seen = set()
-    result = []
-    for label in labels:
-        label = label.lower()
-        if label.endswith('.*'):
-            app_label = label[:-2]
-            # Special-case: dynamic Custom Object models are not discoverable via
-            # the standard app registry wildcard — enumerate them explicitly.
-            if app_label == _CUSTOM_OBJECTS_APP:
-                model_classes = _resolve_dynamic_custom_object_models()
-            else:
-                try:
-                    model_classes = list(apps.get_app_config(app_label).get_models())
-                except LookupError:
-                    logger.warning(
-                        'could not find app %r — skipping',
-                        app_label,
-                    )
-                    continue
-        else:
-            try:
-                app_label, model_name = label.split('.', 1)
-                model_classes = [apps.get_model(app_label, model_name)]
-            except (ValueError, LookupError):
-                logger.warning(
-                    'could not find model %r — skipping',
-                    label,
-                )
-                continue
-
-        for model_class in model_classes:
-            key = (model_class._meta.app_label, model_class._meta.model_name)
-            if key not in seen:
-                seen.add(key)
-                result.append(model_class)
-
-    return result
 
 
 def _inject_co_urls():
@@ -162,47 +84,131 @@ def _deduplicate_registry():
                 model_map[model_name] = deduped
 
 
+# Hardcoded label/weight defaults.  The source plugin exposed these as
+# PLUGINS_CONFIG knobs; the integrated version drops the knobs because target
+# discovery is now automatic — the only per-COT control is show_dedicated_tab.
+_COMBINED_LABEL = 'Custom Objects'
+_COMBINED_WEIGHT = 2000
+_TYPED_WEIGHT = 2100
+
+
+def _discover_target_content_type_ids():
+    """
+    Return the set of ContentType IDs that should host a Custom Objects tab.
+
+    A ContentType is a target iff at least one CustomObjectTypeField of type
+    OBJECT or MULTIOBJECT references it — via either ``related_object_type``
+    (non-polymorphic FK) or ``related_object_types`` (polymorphic M2M).
+
+    Returns None if the database is not yet usable (fresh install before
+    migrations).  Callers should treat that as "register nothing this round".
+    """
+    from django.db.utils import OperationalError, ProgrammingError
+    from extras.choices import CustomFieldTypeChoices
+    from netbox_custom_objects.models import CustomObjectTypeField
+
+    type_choices = [
+        CustomFieldTypeChoices.TYPE_OBJECT,
+        CustomFieldTypeChoices.TYPE_MULTIOBJECT,
+    ]
+
+    try:
+        non_poly = set(
+            CustomObjectTypeField.objects.filter(
+                is_polymorphic=False,
+                type__in=type_choices,
+            )
+            .exclude(related_object_type__isnull=True)
+            .values_list('related_object_type_id', flat=True)
+        )
+        poly = set(
+            CustomObjectTypeField.objects.filter(
+                is_polymorphic=True,
+                type__in=type_choices,
+            ).values_list('related_object_types__id', flat=True)
+        )
+    except (OperationalError, ProgrammingError):
+        logger.warning('database unavailable - tabs not registered until next start')
+        return None
+
+    return {ct for ct in non_poly | poly if ct is not None}
+
+
+def _resolve_model_classes(ct_ids):
+    """
+    Return a deduplicated list of model classes for the given ContentType IDs.
+
+    Skips ContentTypes whose model class can't be resolved (e.g. an
+    uninstalled plugin or a stale CT row pointing at a deleted dynamic model).
+    """
+    from django.contrib.contenttypes.models import ContentType
+    from django.db.utils import OperationalError, ProgrammingError
+
+    seen_keys = set()
+    result = []
+    try:
+        cts = list(ContentType.objects.filter(pk__in=ct_ids))
+    except (OperationalError, ProgrammingError):
+        logger.warning('database unavailable during ContentType resolution')
+        return result
+
+    for ct in cts:
+        try:
+            model = ct.model_class()
+        except Exception:
+            logger.exception('could not resolve model for ContentType %s', ct)
+            continue
+        if model is None:
+            logger.warning('ContentType %s has no model class - skipping', ct)
+            continue
+        key = (model._meta.app_label, model._meta.model_name)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        result.append(model)
+
+    return result
+
+
 def register_tabs():
     """
-    Read plugin config and register both combined and typed tabs.
-    Called from AppConfig.ready().
+    Auto-discover target NetBox models from CustomObjectTypeField references
+    and register combined + typed tabs for each.
 
-    All registration must happen synchronously here: NetBox builds each model's
-    URLconf (via ``get_model_urls()``) on the first ``resolve()`` call, snapshotting
-    ``registry['views']`` at that moment.  Anything added to the registry after the
-    URLconf is built has no URL pattern.  Likewise, ``_inject_co_urls()`` mutates
-    ``netbox_custom_objects.urls.urlpatterns`` and must run before any URL resolver
-    populates its lookup cache against that list.
+    Called from ``CustomObjectsPluginConfig.ready()`` as a third pass, after
+    the existing two-pass model + serializer registration.
 
-    Earlier versions deferred typed-tab registration to the first HTTP request
-    (commit 5bf09c3, PR #4) to silence DB-access warnings from Django and
-    netbox_branching.  That broke typed-tab URL routing entirely — the Add-button
-    feature in 2.3.0 was never reachable on a deployment.  See 2.3.0 release notes.
+    All registration must happen synchronously here: NetBox builds each
+    model's URLconf (via ``get_model_urls()``) on the first ``resolve()``
+    call, snapshotting ``registry['views']`` at that moment.  Anything added
+    to the registry after the URLconf is built has no URL pattern.  Likewise,
+    ``_inject_co_urls()`` mutates ``netbox_custom_objects.urls.urlpatterns``
+    and must run before the URL resolver populates its lookup cache against
+    that list.
 
-    The ``OperationalError`` / ``ProgrammingError`` safety net inside
-    ``register_typed_tabs`` covers the ``manage.py migrate`` / fresh-DB case.
+    Earlier source-plugin versions deferred typed-tab registration to the
+    first HTTP request (commit 5bf09c3, PR #4) to silence DB-access warnings
+    from Django and netbox_branching.  That broke typed-tab URL routing
+    entirely — the Add-button feature in 2.3.0 was never reachable on a
+    deployment.  See standalone-plugin 2.3.0 release notes.
+
+    Database errors during target discovery are swallowed so that
+    ``manage.py migrate`` on a fresh DB doesn't blow up; tabs come up on the
+    next process start once migrations have applied.
     """
-    try:
-        combined_labels = get_plugin_config('netbox_custom_objects.related_tabs', 'combined_models')
-        combined_label = get_plugin_config('netbox_custom_objects.related_tabs', 'combined_label')
-        combined_weight = get_plugin_config('netbox_custom_objects.related_tabs', 'combined_weight')
-        typed_labels = get_plugin_config('netbox_custom_objects.related_tabs', 'typed_models')
-        typed_weight = get_plugin_config('netbox_custom_objects.related_tabs', 'typed_weight')
-    except Exception:
-        logger.exception('Could not read netbox_custom_objects_tab plugin config')
+    ct_ids = _discover_target_content_type_ids()
+    if not ct_ids:
+        # Either the DB is not ready or no COT fields reference anything yet.
         return
 
-    combined_models = []
-    if combined_labels:
-        combined_models = _resolve_model_labels(combined_labels)
-        register_combined_tabs(combined_models, combined_label, combined_weight)
+    model_classes = _resolve_model_classes(ct_ids)
+    if not model_classes:
+        return
 
-    typed_models = []
-    if typed_labels:
-        typed_models = _resolve_model_labels(typed_labels)
-        register_typed_tabs(typed_models, typed_weight)
+    register_combined_tabs(model_classes, _COMBINED_LABEL, _COMBINED_WEIGHT)
+    register_typed_tabs(model_classes, _TYPED_WEIGHT)
 
-    if any(m._meta.app_label == _CUSTOM_OBJECTS_APP for m in combined_models + typed_models):
+    if any(m._meta.app_label == _CUSTOM_OBJECTS_APP for m in model_classes):
         _inject_co_urls()
 
     _deduplicate_registry()
