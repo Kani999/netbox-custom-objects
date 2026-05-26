@@ -267,7 +267,12 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
     """
     badge_fn = _count_for_type(custom_object_type, field_infos, host_ct_id)
     cot_pk = custom_object_type.pk
-    cot_label = str(custom_object_type)
+    # Tab label: prefer the COT's explicitly-set verbose_name_plural ("AIO
+    # Baselines") over CustomObjectType.display_name which falls back to a
+    # title-cased `name` ("Aio_baseline").  Most COTs created via the UI set
+    # verbose_name_plural; only str(cot) is used when both verbose_name and
+    # verbose_name_plural are blank.  Observed 2026-05-26 smoke Run 4.
+    cot_label = custom_object_type.verbose_name_plural or str(custom_object_type)
 
     def _visible(instance):
         """
