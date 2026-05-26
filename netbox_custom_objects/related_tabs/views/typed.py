@@ -269,9 +269,35 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
     cot_pk = custom_object_type.pk
     cot_label = str(custom_object_type)
 
+    def _visible(instance):
+        """
+        Defence-in-depth: re-check ``show_dedicated_tab`` from the DB per
+        render so a missed hot-reload (or a worker that hasn't yet picked
+        up the Redis version bump) can't leave a stale typed tab visible
+        after the COT has been flipped to show_dedicated_tab=False.
+
+        Cost: one indexed-PK read per visible tab per render.  Negligible
+        compared with the badge query that already runs for each tab.
+
+        Returns False (hide) on DoesNotExist — the COT was deleted but our
+        registry hasn't been re-registered yet.
+        """
+        from netbox_custom_objects.models import CustomObjectType as _COTModel
+
+        try:
+            return _COTModel.objects.values_list('show_dedicated_tab', flat=True).get(pk=cot_pk)
+        except _COTModel.DoesNotExist:
+            return False
+        except Exception:
+            # Any DB error (e.g. mid-migration) — fail closed.  We'd rather
+            # hide a tab than 500 the entire detail page.
+            logger.exception('show_dedicated_tab visibility check failed for COT %s', cot_pk)
+            return False
+
     class _TypedTabView(View):
         tab = ViewTab(
             label=cot_label,
+            visible=_visible,
             badge=badge_fn,
             weight=weight,
             hide_if_empty=True,

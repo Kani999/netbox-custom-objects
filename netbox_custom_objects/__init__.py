@@ -330,6 +330,22 @@ class CustomObjectsPluginConfig(PluginConfig):
                 "related_tabs.register_tabs() failed; continuing without tabs"
             )
 
+        # Seed the Redis-shared registry version after the initial
+        # registration so a later Redis flush + worker restart doesn't
+        # leave the cluster in a "remote == 0 <= local == N" steady state
+        # where workers permanently skip refreshing.  ``cache.add`` is a
+        # no-op if the key already exists, so this is safe to run on
+        # every startup.
+        try:
+            from django.core.cache import cache
+            from netbox_custom_objects.related_tabs import _REDIS_KEY
+            cache.add(_REDIS_KEY, 1, timeout=None)
+        except Exception:
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).exception(
+                "related_tabs Redis key seed failed; hot-reload may be unreliable after a Redis flush"
+            )
+
         # Wire the post_save/post_delete signal handlers that drive hot-reload.
         # Must run after register_tabs() so the initial registration is already
         # in place — otherwise a save fired during startup would race against
