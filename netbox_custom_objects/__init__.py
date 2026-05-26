@@ -296,6 +296,19 @@ class CustomObjectsPluginConfig(PluginConfig):
         from django.apps import apps as django_apps
         django_apps.clear_cache()
 
+        # super().ready() is PluginConfig.ready(), which calls
+        # netbox.models.features.register_models(*self.get_models()) — that's
+        # what adds the changelog/journal/jobs/etc. view entries to
+        # registry['views'] for every NetBoxModel subclass in this plugin.
+        # Our register_tabs() below indirectly triggers
+        # netbox_custom_objects/urls.py to load (via _inject_co_urls()), and
+        # urls.py snapshots registry['views'] via get_model_urls() at import
+        # time.  If we ran register_tabs() before super().ready(), urls.py
+        # would be loaded with an incomplete registry and the resulting
+        # urlpatterns would be missing changelog/journal/etc. — breaking
+        # reverse() for every NetBoxModel feature URL on CustomObjectType.
+        super().ready()
+
         try:
             from netbox_custom_objects.related_tabs.registry import register_tabs
             register_tabs()
@@ -304,8 +317,6 @@ class CustomObjectsPluginConfig(PluginConfig):
             logging.getLogger(__name__).exception(
                 "related_tabs.register_tabs() failed; continuing without tabs"
             )
-
-        super().ready()
 
     def get_model(self, model_name, require_ready=True):
         self.apps.check_apps_ready()
