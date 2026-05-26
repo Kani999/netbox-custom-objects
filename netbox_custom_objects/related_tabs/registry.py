@@ -212,3 +212,72 @@ def register_tabs():
         _inject_co_urls()
 
     _deduplicate_registry()
+
+
+# ---------------------------------------------------------------------------
+# Hot-reload helpers (P4)
+# ---------------------------------------------------------------------------
+# Names produced by register_combined_tabs / register_typed_tabs.  Used by
+# _purge_tab_entries() to identify OUR registry entries without touching tabs
+# registered by other apps or plugins.
+_COMBINED_NAME = 'custom_objects'
+_TYPED_NAME_PREFIX = 'custom_objects_'
+# URL pattern names injected by _inject_co_urls():
+# - combined: 'customobject_custom_objects'
+# - typed:    'customobject_custom_objects_<slug>'
+_URL_NAME_PREFIX = 'customobject_custom_objects'
+
+
+def _is_our_tab_name(name):
+    """True if the registry entry name was created by register_combined_tabs / register_typed_tabs."""
+    return name == _COMBINED_NAME or name.startswith(_TYPED_NAME_PREFIX)
+
+
+def _purge_tab_entries():
+    """
+    Remove our combined + typed tab registrations from registry['views'].
+
+    Called by ``_do_refresh()`` before re-running ``register_tabs()`` so that
+    stale entries (e.g. a typed tab whose COT was deleted or had
+    ``show_dedicated_tab`` toggled off) are evicted instead of accumulating.
+    """
+    from netbox.registry import registry
+
+    for model_map in registry['views'].values():
+        for model_name, entries in list(model_map.items()):
+            filtered = [e for e in entries if not _is_our_tab_name(e['name'])]
+            if len(filtered) < len(entries):
+                model_map[model_name] = filtered
+
+
+def _purge_injected_urls():
+    """
+    Remove URL patterns previously appended to ``netbox_custom_objects.urls``
+    by ``_inject_co_urls()``, identified by the ``customobject_custom_objects``
+    name prefix.
+    """
+    try:
+        import netbox_custom_objects.urls as co_urls
+    except ImportError:
+        return
+
+    co_urls.urlpatterns[:] = [
+        p for p in co_urls.urlpatterns if not (hasattr(p, 'name') and p.name and p.name.startswith(_URL_NAME_PREFIX))
+    ]
+
+
+def _do_refresh():
+    """
+    Tear-down + re-register the entire tab registry.
+
+    Used by the public ``refresh_if_stale()`` / ``force_local_refresh()`` API
+    in ``netbox_custom_objects.related_tabs``.  The caller is responsible for
+    serialising calls (the module-level RLock) and for updating the local
+    version counter afterwards.
+    """
+    from django.urls import clear_url_caches
+
+    _purge_tab_entries()
+    _purge_injected_urls()
+    register_tabs()
+    clear_url_caches()

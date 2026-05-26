@@ -134,6 +134,18 @@ class CustomObjectsPluginConfig(PluginConfig):
     required_settings = []
     template_extensions = "template_content.template_extensions"
 
+    # NetBox appends each plugin's middleware list to the global MIDDLEWARE
+    # setting at startup (see netbox/settings.py around the
+    # plugin_config.middleware line).  This middleware checks the
+    # Redis-shared tab-registry version on every request and refreshes our
+    # local registry when another worker has mutated it, so
+    # CustomObjectType / CustomObjectTypeField changes (including
+    # show_dedicated_tab toggles) propagate across gunicorn workers without
+    # requiring a NetBox restart.
+    middleware = [
+        "netbox_custom_objects.related_tabs.middleware.TabRegistryRefreshMiddleware",
+    ]
+
     @staticmethod
     def should_skip_dynamic_model_creation():
         """
@@ -316,6 +328,19 @@ class CustomObjectsPluginConfig(PluginConfig):
             import logging  # noqa: PLC0415
             logging.getLogger(__name__).exception(
                 "related_tabs.register_tabs() failed; continuing without tabs"
+            )
+
+        # Wire the post_save/post_delete signal handlers that drive hot-reload.
+        # Must run after register_tabs() so the initial registration is already
+        # in place — otherwise a save fired during startup would race against
+        # the initial register_tabs() call inside _do_refresh().
+        try:
+            from netbox_custom_objects.related_tabs.signals import connect as connect_related_tabs_signals
+            connect_related_tabs_signals()
+        except Exception:
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).exception(
+                "related_tabs.signals.connect() failed; hot-reload disabled, restart required after COT changes"
             )
 
     def get_model(self, model_name, require_ready=True):
