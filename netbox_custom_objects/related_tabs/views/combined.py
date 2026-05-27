@@ -14,7 +14,7 @@ from netbox.tables import BaseTable
 from netbox_custom_objects.models import CustomObjectTypeField
 from utilities.htmx import htmx_partial
 from utilities.paginator import EnhancedPaginator, get_paginate_count
-from utilities.views import ViewTab, register_model_view
+from utilities.views import ConditionalLoginRequiredMixin, ViewTab, register_model_view
 
 from ._co_common import _CUSTOM_OBJECTS_APP, _get_base_template
 
@@ -216,7 +216,7 @@ def _make_tab_view(model_class, label='Custom Objects', weight=2000):
     separate entries and URL names do not collide.
     """
 
-    class _TabView(View):
+    class _TabView(ConditionalLoginRequiredMixin, View):
         tab = ViewTab(
             label=label,
             badge=_count_linked_custom_objects,

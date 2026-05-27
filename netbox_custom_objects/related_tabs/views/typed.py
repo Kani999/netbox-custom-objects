@@ -17,7 +17,7 @@ from netbox_custom_objects.filtersets import get_filterset_class
 from netbox_custom_objects.models import CustomObjectTypeField
 from netbox_custom_objects.tables import CustomObjectTable
 from utilities.forms.fields import TagFilterField
-from utilities.views import ViewTab, register_model_view
+from utilities.views import ConditionalLoginRequiredMixin, ViewTab, register_model_view
 
 from ._co_common import _CO_BASE_TEMPLATE, _CUSTOM_OBJECTS_APP, _get_base_template  # noqa: F401
 
@@ -296,7 +296,7 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
             logger.exception('show_dedicated_tab visibility check failed for COT %s', cot_pk)
             return False
 
-    class _TypedTabView(View):
+    class _TypedTabView(ConditionalLoginRequiredMixin, View):
         tab = ViewTab(
             label=cot_label,
             visible=_visible,
