@@ -223,9 +223,17 @@ def register_tabs():
 _COMBINED_NAME = 'custom_objects'
 _TYPED_NAME_PREFIX = 'custom_objects_'
 # URL pattern names injected by _inject_co_urls():
-# - combined: 'customobject_custom_objects'
-# - typed:    'customobject_custom_objects_<slug>'
-_URL_NAME_PREFIX = 'customobject_custom_objects'
+# - combined: 'customobject_custom_objects' (exact)
+# - typed:    'customobject_custom_objects_<slug>' (prefix + underscore)
+_URL_NAME_EXACT = 'customobject_custom_objects'
+_URL_NAME_TYPED_PREFIX = 'customobject_custom_objects_'
+
+
+def _is_our_url_name(name):
+    """True if `name` is a URL pattern we injected.  Anchored on the
+    underscore separator so a hypothetical future name like
+    ``customobject_custom_objectsX`` is not over-matched."""
+    return name == _URL_NAME_EXACT or name.startswith(_URL_NAME_TYPED_PREFIX)
 
 
 def _is_our_tab_name(name):
@@ -262,7 +270,7 @@ def _purge_injected_urls():
         return
 
     co_urls.urlpatterns[:] = [
-        p for p in co_urls.urlpatterns if not (hasattr(p, 'name') and p.name and p.name.startswith(_URL_NAME_PREFIX))
+        p for p in co_urls.urlpatterns if not (hasattr(p, 'name') and p.name and _is_our_url_name(p.name))
     ]
 
 

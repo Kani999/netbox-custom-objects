@@ -70,9 +70,14 @@ def _bump_remote_version() -> int:
         return int(cache.incr(_REDIS_KEY))
     except Exception:
         logger.exception('failed to bump remote tab-registry version')
-        # Best-effort fallback: return local+1 so refresh_if_stale still fires
-        # in-process even if Redis is unavailable.
-        return _tab_registry_version + 1
+        # Best-effort fallback: leave local version unchanged when Redis is
+        # unavailable.  Advancing local+1 here would put this worker ahead of
+        # the recovered Redis counter — peers comparing remote vs their own
+        # local would then see remote <= local and skip legitimate refreshes
+        # until restart.  In-process refresh already ran in
+        # force_local_refresh() before this call, so the worker that handled
+        # the mutation sees the change; we just don't broadcast.
+        return _tab_registry_version
 
 
 def refresh_if_stale() -> bool:

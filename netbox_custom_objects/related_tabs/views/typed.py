@@ -33,10 +33,7 @@ def _build_q_for_field(host_ct_id, instance_pk, field_info):
     last two are only meaningful for polymorphic fields. Returns Q() (an empty
     no-op filter) if the field can't be resolved, so callers can OR it safely.
     """
-    field_name = field_info[0]
-    field_type = field_info[1]
-    is_poly = field_info[3] if len(field_info) >= 5 else False
-    through_model_name = field_info[4] if len(field_info) >= 5 else None
+    field_name, field_type, _label, is_poly, through_model_name = field_info
 
     if field_type == CustomFieldTypeChoices.TYPE_OBJECT:
         if is_poly:
@@ -167,9 +164,11 @@ def _build_add_links(custom_object_type_slug, host_instance, field_infos, return
     Returns [] when the customobject_add URL can't be reversed (e.g. plugin URL
     conf not loaded yet).
     """
+    from netbox_custom_objects.models import CustomObject
+
     try:
         add_base = reverse(
-            'plugins:netbox_custom_objects:customobject_add',
+            CustomObject._get_viewname('add'),
             kwargs={'custom_object_type': custom_object_type_slug},
         )
     except NoReverseMatch:
@@ -183,14 +182,12 @@ def _build_add_links(custom_object_type_slug, host_instance, field_infos, return
     links = []
     seen = set()
     for field_info in field_infos:
-        field_name = field_info[0]
+        field_name, field_type, label, is_poly, _through = field_info
         if field_name in seen:
             continue
         seen.add(field_name)
 
-        field_type = field_info[1]
-        field_label = (field_info[2] if len(field_info) >= 3 and field_info[2] else field_name) or field_name
-        is_poly = len(field_info) >= 5 and field_info[3]
+        field_label = label or field_name
 
         if not is_poly:
             prefill = {field_name: host_pk}
@@ -355,7 +352,10 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
                     has_filter = True
 
             if has_filter:
-                base_qs = dynamic_model.objects.filter(q_filter).distinct()
+                try:
+                    base_qs = dynamic_model.objects.restrict(request.user, 'view').filter(q_filter).distinct()
+                except AttributeError:
+                    base_qs = dynamic_model.objects.filter(q_filter).distinct()
             else:
                 base_qs = dynamic_model.objects.none()
 

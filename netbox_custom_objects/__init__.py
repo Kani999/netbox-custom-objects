@@ -343,11 +343,14 @@ class CustomObjectsPluginConfig(PluginConfig):
         # leave the cluster in a "remote == 0 <= local == N" steady state
         # where processes permanently skip refreshing.  ``cache.add`` is a
         # no-op if the key already exists, so this is safe to run on
-        # every startup.
+        # every startup.  Also align this process's local version with
+        # the (seeded or existing) Redis value so the first request served
+        # doesn't trigger a redundant full refresh on every cold start.
         try:
             from django.core.cache import cache
-            from netbox_custom_objects.related_tabs import _REDIS_KEY
-            cache.add(_REDIS_KEY, 1, timeout=None)
+            from netbox_custom_objects import related_tabs as _rt
+            cache.add(_rt._REDIS_KEY, 1, timeout=None)
+            _rt._tab_registry_version = _rt._get_remote_version()
         except Exception:
             import logging  # noqa: PLC0415
             logging.getLogger(__name__).exception(

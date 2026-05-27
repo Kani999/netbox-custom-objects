@@ -111,14 +111,26 @@ def _iter_linked_fields(instance):
                 yield field, model, {field.name: instance.pk}
 
 
-def _get_linked_custom_objects(instance):
+def _get_linked_custom_objects(instance, user=None):
     """
     Return list of (custom_object_instance, CustomObjectTypeField) tuples for all
     custom objects that reference this instance via OBJECT or MULTIOBJECT fields.
+
+    When ``user`` is given, results are filtered through NetBox's per-row
+    ``.restrict(user, 'view')`` so callers don't leak rows the user can't see.
+    The badge callable cannot pass a user (it's invoked from a template tag
+    without request context), so badge counts may include hidden rows — this
+    matches NetBox's general badge convention.
     """
     results = []
     for field, model, filter_kwargs in _iter_linked_fields(instance):
-        for obj in model.objects.filter(**filter_kwargs).prefetch_related('tags'):
+        qs = model.objects.filter(**filter_kwargs).prefetch_related('tags')
+        if user is not None:
+            try:
+                qs = qs.restrict(user, 'view')
+            except AttributeError:
+                pass
+        for obj in qs:
             results.append((obj, field))
     return results
 
@@ -226,7 +238,7 @@ def _make_tab_view(model_class, label='Custom Objects', weight=2000):
                 qs = actual_model.objects.all()
 
             instance = get_object_or_404(qs, pk=pk)
-            linked_all = _get_linked_custom_objects(instance)
+            linked_all = _get_linked_custom_objects(instance, user=request.user)
 
             # Build table object for column-preference machinery (no data, just column config)
             tab_table = CustomObjectsTabTable([], empty_text='')
