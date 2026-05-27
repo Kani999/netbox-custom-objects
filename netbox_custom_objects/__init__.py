@@ -322,8 +322,16 @@ class CustomObjectsPluginConfig(PluginConfig):
         super().ready()
 
         try:
+            from django.urls import clear_url_caches
             from netbox_custom_objects.related_tabs.registry import register_tabs
             register_tabs()
+            # register_tabs() mutates netbox_custom_objects.urls.urlpatterns
+            # via _inject_co_urls().  Drop any URL resolver caches that
+            # super().ready() / other plugins' ready() may have built so
+            # reverse() resolves against the patched patterns.  Mirrors the
+            # clear_url_caches() call _do_refresh() makes after every
+            # hot-reload.
+            clear_url_caches()
         except Exception:
             import logging  # noqa: PLC0415
             logging.getLogger(__name__).exception(

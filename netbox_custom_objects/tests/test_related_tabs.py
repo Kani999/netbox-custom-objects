@@ -261,30 +261,36 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
 
     def test_dispatch_uids_idempotent(self):
         """Connect signals twice — should not duplicate registrations."""
+        from django.db.models.signals import post_delete
         from netbox_custom_objects.related_tabs.signals import connect
 
+        uids = {
+            'related_tabs_refresh_on_save_cot',
+            'related_tabs_refresh_on_save_cotfield',
+            'related_tabs_refresh_on_delete_cot',
+            'related_tabs_refresh_on_delete_cotfield',
+            'related_tabs_refresh_on_cotfield_related_object_types_changed',
+        }
+
         def _count_with_uids():
-            uids = {
-                'related_tabs_refresh_on_save_cot',
-                'related_tabs_refresh_on_save_cotfield',
-                'related_tabs_refresh_on_delete_cot',
-                'related_tabs_refresh_on_delete_cotfield',
-                'related_tabs_refresh_on_cotfield_related_object_types_changed',
-            }
-            hashes = {hash(u) for u in uids}
             count = 0
-            for signal in (post_save, m2m_changed):
+            for signal in (post_save, post_delete, m2m_changed):
                 for entry in signal.receivers:
-                    if entry[0][0] in hashes:
+                    # When dispatch_uid is provided, Django uses it directly
+                    # as lookup_key[0] — a plain string, not a hash.
+                    if entry[0][0] in uids:
                         count += 1
             return count
 
-        before = _count_with_uids()
+        # Ensure a non-zero baseline so the test would actually fail if
+        # dispatch_uid de-dup broke (otherwise before == after == 0 passes
+        # vacuously regardless of dedup behaviour).
         connect()
+        before = _count_with_uids()
+        self.assertEqual(before, len(uids))
+
         connect()
         after = _count_with_uids()
-        # The same number of entries should remain — Django's dispatch_uid
-        # de-duplication kicks in.
         self.assertEqual(before, after)
 
 
