@@ -134,17 +134,9 @@ class CustomObjectsPluginConfig(PluginConfig):
     required_settings = []
     template_extensions = "template_content.template_extensions"
 
-    # NetBox appends each plugin's middleware list to the global MIDDLEWARE
-    # setting at startup (see netbox/settings.py around the
-    # plugin_config.middleware line).  This middleware checks the
-    # Redis-shared tab-registry version on every request and refreshes our
-    # local registry when another worker has mutated it, so
-    # CustomObjectType / CustomObjectTypeField changes (including
-    # show_dedicated_tab toggles) propagate across gunicorn workers without
-    # requiring a NetBox restart.
-    middleware = [
-        "netbox_custom_objects.related_tabs.middleware.TabRegistryRefreshMiddleware",
-    ]
+    # EXPERIMENT branch: no middleware.  See related_tabs/__init__.py for the
+    # rationale — this branch deliberately omits the Redis-shared version
+    # counter + middleware that propagate tab changes across WSGI workers.
 
     @staticmethod
     def should_skip_dynamic_model_creation():
@@ -338,23 +330,13 @@ class CustomObjectsPluginConfig(PluginConfig):
                 "related_tabs.register_tabs() failed; continuing without tabs"
             )
 
-        # Seed the Redis-shared registry version after the initial
-        # registration so a later Redis flush + worker restart doesn't
-        # leave the cluster in a "remote == 0 <= local == N" steady state
-        # where workers permanently skip refreshing.  ``cache.add`` is a
-        # no-op if the key already exists, so this is safe to run on
-        # every startup.
-        try:
-            from django.core.cache import cache
-            from netbox_custom_objects.related_tabs import _REDIS_KEY
-            cache.add(_REDIS_KEY, 1, timeout=None)
-        except Exception:
-            import logging  # noqa: PLC0415
-            logging.getLogger(__name__).exception(
-                "related_tabs Redis key seed failed; hot-reload may be unreliable after a Redis flush"
-            )
+        # EXPERIMENT branch: no Redis seeding, no middleware.  Signal handlers
+        # below refresh only the local process; other workers stay stale until
+        # restart.  This is intentional — the point of this branch is to
+        # demonstrate that local-only refresh is insufficient under multi-worker
+        # deployments.
 
-        # Wire the post_save/post_delete signal handlers that drive hot-reload.
+        # Wire the post_save/post_delete signal handlers that drive local hot-reload.
         # Must run after register_tabs() so the initial registration is already
         # in place — otherwise a save fired during startup would race against
         # the initial register_tabs() call inside _do_refresh().

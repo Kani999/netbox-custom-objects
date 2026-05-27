@@ -369,10 +369,9 @@ def _do_refresh():
     """
     Tear-down + re-register the entire tab registry.
 
-    Used by the public ``refresh_if_stale()`` / ``force_local_refresh()`` API
-    in ``netbox_custom_objects.related_tabs``.  The caller is responsible for
-    serialising calls (the module-level RLock) and for updating the local
-    version counter afterwards.
+    Used by the public ``local_refresh()`` API in
+    ``netbox_custom_objects.related_tabs``.  The caller is responsible for
+    serialising calls (the module-level RLock).
 
     Order matters:
     1. Purge our existing entries from the registry and our injected URLs

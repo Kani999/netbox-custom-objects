@@ -1,23 +1,21 @@
 """
-Tests for the related_tabs subpackage.
+Tests for the related_tabs subpackage — EXPERIMENT (local-only refresh).
 
-Focused on the surfaces most likely to regress:
+This branch removes the Redis-shared version counter and middleware that
+``feature/related-object-tabs-v2`` uses to propagate tab-registry changes
+across WSGI worker processes.  Tests that exercised those code paths
+(``refresh_if_stale``, ``_REDIS_KEY``, ``_tab_registry_version``) are
+intentionally removed.
 
-* ``register_tabs()`` auto-discovery from CustomObjectTypeField rows (both
-  non-polymorphic via ``related_object_type`` and polymorphic via the
-  ``related_object_types`` M2M).
-* ``_purge_tab_entries()`` / ``_purge_injected_urls()`` idempotency — multiple
-  ``_do_refresh()`` cycles leave the registry in a deterministic state with
-  no duplicates and no lost upstream entries.
-* ``ViewTab.visible()`` defence-in-depth predicate — re-reads
-  ``show_dedicated_tab`` live so a missed hot-reload can't show a stale tab.
-* Signal handlers (``post_save`` / ``post_delete`` / ``m2m_changed``) defer
-  via ``transaction.on_commit`` and ultimately bump the local registry
-  version counter.
+What is still covered:
 
-These unit tests catch regressions at the function level so a breaking
-change shows up in CI before manual smoke.
+* ``register_tabs()`` auto-discovery from CustomObjectTypeField rows.
+* ``_purge_tab_entries()`` idempotency.
+* ``ViewTab.visible()`` defence-in-depth predicate.
+* Signal handlers connect/idempotency.
 """
+
+from unittest.mock import patch
 
 from django.contrib.contenttypes.models import ContentType
 from django.db.models.signals import m2m_changed, post_save
@@ -27,10 +25,6 @@ from extras.choices import CustomFieldTypeChoices
 from dcim.models import Site
 
 from netbox_custom_objects.models import CustomObjectType, CustomObjectTypeField
-from netbox_custom_objects.related_tabs import (
-    _REDIS_KEY,
-    refresh_if_stale,
-)
 from netbox_custom_objects.related_tabs.registry import (
     _COMBINED_NAME,
     _TYPED_NAME_PREFIX,
@@ -72,8 +66,6 @@ class DiscoveryTests(TransactionCleanupMixin, CustomObjectsTestCase, Transaction
             verbose_name_plural='Disc Test Bs',
         )
         site_ct = ContentType.objects.get_for_model(Site)
-        # Use site as the only poly target; verifies the M2M code path
-        # without requiring a second host model to exist in test fixtures.
         field = CustomObjectTypeField.objects.create(
             custom_object_type=cot,
             name='related_polymorphic',
@@ -88,9 +80,6 @@ class DiscoveryTests(TransactionCleanupMixin, CustomObjectsTestCase, Transaction
         self.assertIn(site_ct.pk, ct_ids)
 
     def test_no_fields_yields_no_targets(self):
-        # Any pre-existing COT fields from other test runs are isolated by
-        # TransactionCleanupMixin's setup, so without creating any new
-        # OBJECT/MULTIOBJECT field the discovery should return an empty set.
         ct_ids = _discover_target_content_type_ids()
         self.assertEqual(ct_ids, set())
 
@@ -109,7 +98,6 @@ class ResolveModelClassesTests(TestCase):
         self.assertEqual(_resolve_model_classes(set()), [])
 
     def test_skips_nonexistent_content_type(self):
-        # Pass a deliberately-invalid CT id; should be skipped silently.
         result = _resolve_model_classes({-999999})
         self.assertEqual(result, [])
 
@@ -138,7 +126,6 @@ class PurgeRegistryTests(TestCase):
 
         marker_app = '__related_tabs_purge_test__'
         marker_model = 'fakemodel'
-        # Fixture: three entries — combined (ours), typed (ours), changelog (not ours)
         registry['views'].setdefault(marker_app, {})[marker_model] = [
             {'name': _COMBINED_NAME, 'path': 'custom-objects', 'view': object(), 'detail': True, 'kwargs': {}},
             {
@@ -163,7 +150,6 @@ class ViewTabVisibleTests(TransactionCleanupMixin, CustomObjectsTestCase, Transa
     """ViewTab.visible() reads show_dedicated_tab live per render."""
 
     def _make_tab_view(self, cot):
-        """Build a one-off typed-tab view for the given COT."""
         from netbox_custom_objects.related_tabs.views.typed import _make_typed_tab_view
 
         return _make_typed_tab_view(
@@ -208,37 +194,26 @@ class ViewTabVisibleTests(TransactionCleanupMixin, CustomObjectsTestCase, Transa
         view_class = self._make_tab_view(cot)
         site = Site.objects.create(name='Visible Site C', slug='visible-site-c')
 
-        # Capture the view first, then delete the COT — the closure still
-        # references its old pk, but the row is gone.
         cot_pk = cot.pk
         cot.delete()
         self.assertFalse(CustomObjectType.objects.filter(pk=cot_pk).exists())
 
-        # visible() must fail closed, not raise.
         self.assertFalse(view_class.tab.visible(site))
 
 
 class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
-    """Signals on COT + COTField + m2m_changed schedule force_local_refresh."""
+    """Signals on COT + COTField + m2m_changed call local_refresh after commit."""
 
-    def test_cot_save_triggers_local_version_bump(self):
-        import netbox_custom_objects.related_tabs as rt
-
-        before = rt._tab_registry_version
-        cot = CustomObjectType.objects.create(
-            name='signal_test_save',
-            slug='signal-test-save',
-            verbose_name_plural='Signal Test Saves',
-        )
-
-        # TransactionTestCase commits after each statement, so the
-        # on_commit callback should have fired.
-        self.assertGreater(rt._tab_registry_version, before)
-        self.assertTrue(CustomObjectType.objects.filter(pk=cot.pk).exists())
+    def test_cot_save_triggers_local_refresh(self):
+        with patch('netbox_custom_objects.related_tabs.local_refresh') as mock_refresh:
+            CustomObjectType.objects.create(
+                name='signal_test_save',
+                slug='signal-test-save',
+                verbose_name_plural='Signal Test Saves',
+            )
+            self.assertTrue(mock_refresh.called)
 
     def test_m2m_changed_on_related_object_types_triggers_refresh(self):
-        import netbox_custom_objects.related_tabs as rt
-
         cot = CustomObjectType.objects.create(
             name='signal_test_m2m',
             slug='signal-test-m2m',
@@ -252,12 +227,10 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
             is_polymorphic=True,
         )
 
-        before = rt._tab_registry_version
         site_ct = ContentType.objects.get_for_model(Site)
-        field.related_object_types.add(site_ct)
-
-        # on_commit fires after the M2M add commits.
-        self.assertGreater(rt._tab_registry_version, before)
+        with patch('netbox_custom_objects.related_tabs.local_refresh') as mock_refresh:
+            field.related_object_types.add(site_ct)
+            self.assertTrue(mock_refresh.called)
 
     def test_dispatch_uids_idempotent(self):
         """Connect signals twice — should not duplicate registrations."""
@@ -276,15 +249,10 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
             count = 0
             for signal in (post_save, post_delete, m2m_changed):
                 for entry in signal.receivers:
-                    # When dispatch_uid is provided, Django uses it directly
-                    # as lookup_key[0] — a plain string, not a hash.
                     if entry[0][0] in uids:
                         count += 1
             return count
 
-        # Ensure a non-zero baseline so the test would actually fail if
-        # dispatch_uid de-dup broke (otherwise before == after == 0 passes
-        # vacuously regardless of dedup behaviour).
         connect()
         before = _count_with_uids()
         self.assertEqual(before, len(uids))
@@ -292,30 +260,3 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
         connect()
         after = _count_with_uids()
         self.assertEqual(before, after)
-
-
-class RefreshIfStaleTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
-    """``refresh_if_stale()`` is a no-op when local == remote and refreshes when behind."""
-
-    def setUp(self):
-        super().setUp()
-        from django.core.cache import cache
-
-        import netbox_custom_objects.related_tabs as rt
-
-        cache.set(_REDIS_KEY, 1, timeout=None)
-        rt._tab_registry_version = 1
-
-    def test_no_op_when_versions_match(self):
-        # Should return False (didn't refresh).
-        self.assertFalse(refresh_if_stale())
-
-    def test_refresh_runs_when_local_behind(self):
-        from django.core.cache import cache
-
-        import netbox_custom_objects.related_tabs as rt
-
-        cache.set(_REDIS_KEY, rt._tab_registry_version + 5, timeout=None)
-        self.assertTrue(refresh_if_stale())
-        # After refresh, local catches up to remote.
-        self.assertEqual(rt._tab_registry_version, rt._get_remote_version())

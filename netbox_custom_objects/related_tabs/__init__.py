@@ -1,24 +1,33 @@
 """
-Related-object tabs for netbox-custom-objects.
+Related-object tabs for netbox-custom-objects — EXPERIMENT: local-only refresh.
 
-Adds a "Custom Objects" combined tab and per-CustomObjectType typed tabs to
-NetBox object detail pages. Vendored from the standalone netbox-custom-objects-tab
-plugin and integrated as a subpackage so the feature ships with the core plugin
-itself.
+This branch removes the Redis-shared version counter and middleware that the
+``feature/related-object-tabs-v2`` branch uses to propagate tab-registry
+changes between WSGI worker processes.  The goal is to empirically observe
+the Stage-1 failure mode from the design discussion: tab mutations made in
+one worker do not reach other workers, so users see inconsistent tab
+visibility depending on which worker handled their request.
 
-Two public entry points:
+What still works here:
 
-* ``registry.register_tabs()`` — initial registration, called once from
+* ``registry.register_tabs()`` — initial registration in
   ``CustomObjectsPluginConfig.ready()``.
-* ``refresh_if_stale()`` / ``force_local_refresh()`` — hot-reload, called by
-  ``TabRegistryRefreshMiddleware`` (every request) and the signal handlers in
-  ``signals`` (after COT/COTField save or delete).
+* ``local_refresh()`` — called by signal handlers in the process that
+  performed a COT/COTField mutation.  Tears down the local tab registry
+  and re-runs ``register_tabs()``.  No cross-process signal.
 
-Hot-reload propagation across gunicorn workers uses a Redis-shared monotonic
-counter (key ``nbco:tab_registry_version``).  Each worker tracks its own
-``_tab_registry_version``; whenever the Redis counter advances past the
-local value, the worker re-runs ``register_tabs()`` and clears the URL
-caches before the next view dispatches.
+What is intentionally missing compared to ``feature/related-object-tabs-v2``:
+
+* ``_tab_registry_version`` process-local counter.
+* ``_REDIS_KEY`` shared monotonic counter in Redis.
+* ``refresh_if_stale()`` middleware entry point.
+* ``TabRegistryRefreshMiddleware``.
+* Redis seeding on startup in ``ready()``.
+
+Run NetBox under ``gunicorn --workers 2+`` (not the dev server) to observe
+the inconsistency: PATCH ``show_dedicated_tab=true`` on a CustomObjectType
+and reload a related detail page repeatedly — only the worker that handled
+the PATCH will show the new tab.
 """
 
 import logging
@@ -26,105 +35,24 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-# Process-local monotonic counter.  Compared against the Redis value to
-# decide whether this worker needs to re-run register_tabs().
-_tab_registry_version: int = 0
-
-# Serialises (a) reads/writes of _tab_registry_version and (b) the
-# purge + re-register sequence in _do_refresh().  RLock so a signal handler
+# Serialises the purge + re-register sequence in _do_refresh() against
+# concurrent threads within the same process.  RLock so a signal handler
 # that fires while we're holding the lock can re-enter without deadlock.
 _global_lock = threading.RLock()
 
-# Redis key shared across workers.  Bumped by the post_save/post_delete
-# signal handlers in the worker that handled the mutation; observed by other
-# workers via the middleware.
-_REDIS_KEY = 'nbco:tab_registry_version'
 
-
-def _get_remote_version() -> int:
-    """Return the Redis-shared registry version (0 if absent or Redis is down)."""
-    from django.core.cache import cache
-
-    try:
-        value = cache.get(_REDIS_KEY)
-    except Exception:
-        logger.exception('failed to read remote tab-registry version')
-        return 0
-    return int(value or 0)
-
-
-def _bump_remote_version() -> int:
+def local_refresh() -> None:
     """
-    Atomically increment the Redis counter and return the new value.
+    Refresh the in-process tab registry unconditionally.
 
-    Uses ``cache.add`` to seed the key when absent (returning False if the key
-    already exists), then ``cache.incr``.  Two concurrent first-bumpers may
-    both ``add(0)``; the second's ``add`` is a no-op and both ``incr`` calls
-    serialise in Redis, so they end up with consecutive values rather than
-    racing past each other.
+    Called from signal handlers in the process that just performed a COT or
+    COTField mutation.  Only the calling process is updated — other WSGI
+    workers will continue to serve the old registry until their next restart.
     """
-    from django.core.cache import cache
-
-    try:
-        cache.add(_REDIS_KEY, 0, timeout=None)
-        return int(cache.incr(_REDIS_KEY))
-    except Exception:
-        logger.exception('failed to bump remote tab-registry version')
-        # Best-effort fallback: return local+1 so refresh_if_stale still fires
-        # in-process even if Redis is unavailable.
-        return _tab_registry_version + 1
-
-
-def refresh_if_stale() -> bool:
-    """
-    Re-register tabs if our local version is behind the Redis counter.
-
-    Called from ``TabRegistryRefreshMiddleware`` on every request and from
-    the signal handlers in the worker that mutated the COT.  The fast path
-    (when versions match) is a single Redis GET and no lock contention.
-
-    Returns True if a refresh actually ran, False otherwise.
-    """
-    global _tab_registry_version
-    remote = _get_remote_version()
-    if remote <= _tab_registry_version:
-        return False
-
-    with _global_lock:
-        # Re-check after acquiring the lock: another worker thread may have
-        # just refreshed and advanced the local version.
-        if remote <= _tab_registry_version:
-            return False
-        try:
-            from netbox_custom_objects.related_tabs.registry import _do_refresh
-
-            _do_refresh()
-        except Exception:
-            logger.exception('related_tabs hot-reload refresh failed')
-            return False
-        _tab_registry_version = remote
-        return True
-
-
-def force_local_refresh() -> int:
-    """
-    Refresh local registry unconditionally and bump Redis so peers refresh.
-
-    Called from signal handlers in the worker that just performed a COT or
-    COTField mutation.  Always refreshes in-process (the worker that handled
-    the mutation will see the change on its own next view dispatch) AND bumps
-    the Redis counter so other workers' middleware notices on next request.
-
-    Returns the new local/Redis version (which are equal after this call).
-    """
-    global _tab_registry_version
     with _global_lock:
         try:
             from netbox_custom_objects.related_tabs.registry import _do_refresh
 
             _do_refresh()
         except Exception:
-            logger.exception('related_tabs hot-reload refresh failed')
-            return _tab_registry_version
-        _tab_registry_version = _bump_remote_version()
-        return _tab_registry_version
+            logger.exception('related_tabs local refresh failed')
