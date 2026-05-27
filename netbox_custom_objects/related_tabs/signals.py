@@ -1,10 +1,10 @@
 """
-Django signals that drive multi-worker tab hot-reload.
+Django signals that drive multi-process tab hot-reload.
 
 When a CustomObjectType or CustomObjectTypeField is created, modified, or
-deleted, the worker that handled the request bumps a shared Redis counter
-and refreshes its own tab registry.  Other gunicorn workers pick up the
-change via ``TabRegistryRefreshMiddleware`` on their next request.
+deleted, the process that handled the request bumps a shared Redis counter
+and refreshes its own tab registry.  Other WSGI worker processes pick up
+the change via ``TabRegistryRefreshMiddleware`` on their next request.
 
 The handlers are intentionally minimal: a single ``force_local_refresh()``
 call covers both add and remove cases because ``_do_refresh()`` tears down

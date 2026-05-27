@@ -346,7 +346,7 @@ class DeletionTestCase(TransactionCleanupMixin, CustomObjectsTestCase, Transacti
         )
 
     def test_object_field_save_bumps_related_cot_cache_timestamp(self):
-        """Creating a TYPE_OBJECT field must bump the related COT's cache_timestamp for cross-worker invalidation."""
+        """Creating a TYPE_OBJECT field must bump the related COT's cache_timestamp for cross-process invalidation."""
         cot_target = self.create_simple_custom_object_type(name='cttarget', slug='ct-target')
         cot_source = self.create_simple_custom_object_type(name='ctsource', slug='ct-source')
 

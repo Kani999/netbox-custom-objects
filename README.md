@@ -79,7 +79,7 @@ available from bulk edit, CSV import, and the REST API
 
 Toggling **Show dedicated tab**, creating or deleting a Custom Object Type,
 or editing a polymorphic field's allowed target types takes effect on the
-next page load without restarting NetBox or `gunicorn`. Cross-worker
+next page load without restarting NetBox or its WSGI server. Cross-process
 propagation uses a Redis-shared monotonic counter
 (`nbco:tab_registry_version`) plus a thin middleware
 (`TabRegistryRefreshMiddleware`) that NetBox auto-installs via the plugin

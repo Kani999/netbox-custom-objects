@@ -14,10 +14,10 @@ Two public entry points:
   ``TabRegistryRefreshMiddleware`` (every request) and the signal handlers in
   ``signals`` (after COT/COTField save or delete).
 
-Hot-reload propagation across gunicorn workers uses a Redis-shared monotonic
-counter (key ``nbco:tab_registry_version``).  Each worker tracks its own
-``_tab_registry_version``; whenever the Redis counter advances past the
-local value, the worker re-runs ``register_tabs()`` and clears the URL
+Hot-reload propagation across WSGI worker processes uses a Redis-shared
+monotonic counter (key ``nbco:tab_registry_version``).  Each process tracks
+its own ``_tab_registry_version``; whenever the Redis counter advances past
+the local value, the process re-runs ``register_tabs()`` and clears the URL
 caches before the next view dispatches.
 """
 
@@ -27,7 +27,7 @@ import threading
 logger = logging.getLogger(__name__)
 
 # Process-local monotonic counter.  Compared against the Redis value to
-# decide whether this worker needs to re-run register_tabs().
+# decide whether this process needs to re-run register_tabs().
 _tab_registry_version: int = 0
 
 # Serialises (a) reads/writes of _tab_registry_version and (b) the
@@ -35,9 +35,9 @@ _tab_registry_version: int = 0
 # that fires while we're holding the lock can re-enter without deadlock.
 _global_lock = threading.RLock()
 
-# Redis key shared across workers.  Bumped by the post_save/post_delete
-# signal handlers in the worker that handled the mutation; observed by other
-# workers via the middleware.
+# Redis key shared across processes.  Bumped by the post_save/post_delete
+# signal handlers in the process that handled the mutation; observed by other
+# processes via the middleware.
 _REDIS_KEY = 'nbco:tab_registry_version'
 
 
@@ -80,7 +80,7 @@ def refresh_if_stale() -> bool:
     Re-register tabs if our local version is behind the Redis counter.
 
     Called from ``TabRegistryRefreshMiddleware`` on every request and from
-    the signal handlers in the worker that mutated the COT.  The fast path
+    the signal handlers in the process that mutated the COT.  The fast path
     (when versions match) is a single Redis GET and no lock contention.
 
     Returns True if a refresh actually ran, False otherwise.
@@ -91,8 +91,8 @@ def refresh_if_stale() -> bool:
         return False
 
     with _global_lock:
-        # Re-check after acquiring the lock: another worker thread may have
-        # just refreshed and advanced the local version.
+        # Re-check after acquiring the lock: another thread in this process
+        # may have just refreshed and advanced the local version.
         if remote <= _tab_registry_version:
             return False
         try:
@@ -110,10 +110,10 @@ def force_local_refresh() -> int:
     """
     Refresh local registry unconditionally and bump Redis so peers refresh.
 
-    Called from signal handlers in the worker that just performed a COT or
-    COTField mutation.  Always refreshes in-process (the worker that handled
+    Called from signal handlers in the process that just performed a COT or
+    COTField mutation.  Always refreshes in-process (the process that handled
     the mutation will see the change on its own next view dispatch) AND bumps
-    the Redis counter so other workers' middleware notices on next request.
+    the Redis counter so other processes' middleware notices on next request.
 
     Returns the new local/Redis version (which are equal after this call).
     """

@@ -138,10 +138,10 @@ class CustomObjectsPluginConfig(PluginConfig):
     # setting at startup (see netbox/settings.py around the
     # plugin_config.middleware line).  This middleware checks the
     # Redis-shared tab-registry version on every request and refreshes our
-    # local registry when another worker has mutated it, so
+    # local registry when another process has mutated it, so
     # CustomObjectType / CustomObjectTypeField changes (including
-    # show_dedicated_tab toggles) propagate across gunicorn workers without
-    # requiring a NetBox restart.
+    # show_dedicated_tab toggles) propagate across WSGI worker processes
+    # without requiring a NetBox restart.
     middleware = [
         "netbox_custom_objects.related_tabs.middleware.TabRegistryRefreshMiddleware",
     ]
@@ -339,9 +339,9 @@ class CustomObjectsPluginConfig(PluginConfig):
             )
 
         # Seed the Redis-shared registry version after the initial
-        # registration so a later Redis flush + worker restart doesn't
+        # registration so a later Redis flush + process restart doesn't
         # leave the cluster in a "remote == 0 <= local == N" steady state
-        # where workers permanently skip refreshing.  ``cache.add`` is a
+        # where processes permanently skip refreshing.  ``cache.add`` is a
         # no-op if the key already exists, so this is safe to run on
         # every startup.
         try:

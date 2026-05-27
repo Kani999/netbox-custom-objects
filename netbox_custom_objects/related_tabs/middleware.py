@@ -1,7 +1,7 @@
 """
-Middleware that checks for cross-worker tab-registry updates on each request.
+Middleware that checks for cross-process tab-registry updates on each request.
 
-When another gunicorn worker mutated a CustomObjectType or
+When another WSGI worker process mutated a CustomObjectType or
 CustomObjectTypeField, it bumped the Redis counter in
 ``netbox_custom_objects.related_tabs`` via the signal handlers.  This
 middleware compares local vs remote on every request and, if stale, calls
