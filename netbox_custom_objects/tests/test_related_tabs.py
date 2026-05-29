@@ -23,6 +23,7 @@ change shows up in CI before manual smoke.
 
 from core.models import ObjectType
 from django.contrib.contenttypes.models import ContentType
+from django.db.models import Q
 from django.db.models.signals import post_save
 from django.test import TestCase, TransactionTestCase
 from extras.choices import CustomFieldTypeChoices
@@ -43,7 +44,45 @@ from netbox_custom_objects.related_tabs.registry import (
     _purge_tab_entries,
     _resolve_model_classes,
 )
+from netbox_custom_objects.related_tabs.views._co_common import reference_q
 from netbox_custom_objects.tests.base import CustomObjectsTestCase, TransactionCleanupMixin
+
+
+class ReferenceQTests(TestCase):
+    """
+    ``reference_q()`` builds the correct filter per field kind, and — critically —
+    returns an EMPTY Q (which callers must treat as "skip", never as match-all) for
+    an unsupported field type or an unresolvable polymorphic through model. A
+    regression here would leak every custom object of a type onto every host page.
+    """
+
+    def test_object_non_polymorphic(self):
+        self.assertEqual(
+            reference_q(1, 42, 'site', CustomFieldTypeChoices.TYPE_OBJECT, False, None),
+            Q(site_id=42),
+        )
+
+    def test_object_polymorphic(self):
+        self.assertEqual(
+            reference_q(7, 42, 'thing', CustomFieldTypeChoices.TYPE_OBJECT, True, None),
+            Q(thing_content_type_id=7, thing_object_id=42),
+        )
+
+    def test_multiobject_non_polymorphic(self):
+        self.assertEqual(
+            reference_q(1, 42, 'sites', CustomFieldTypeChoices.TYPE_MULTIOBJECT, False, None),
+            Q(sites=42),
+        )
+
+    def test_unsupported_field_type_returns_empty_q(self):
+        q = reference_q(1, 42, 'x', CustomFieldTypeChoices.TYPE_TEXT, False, None)
+        self.assertFalse(q.children)  # empty Q == "skip", NOT match-all
+
+    def test_unresolvable_through_returns_empty_q(self):
+        # Polymorphic MULTIOBJECT whose through model isn't in the app registry.
+        with self.assertLogs('netbox_custom_objects.related_tabs', level='ERROR'):
+            q = reference_q(1, 42, 'x', CustomFieldTypeChoices.TYPE_MULTIOBJECT, True, 'Through_does_not_exist')
+        self.assertFalse(q.children)
 
 
 class DiscoveryTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):

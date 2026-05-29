@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import django_tables2 as tables2
-from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.core.paginator import InvalidPage
 from django.shortcuts import get_object_or_404, render
@@ -16,7 +15,7 @@ from utilities.htmx import htmx_partial
 from utilities.paginator import EnhancedPaginator, get_paginate_count
 from utilities.views import ConditionalLoginRequiredMixin, ViewTab
 
-from ._co_common import _CUSTOM_OBJECTS_APP, _get_base_template, _register_tab_view, _restrict_or_warn
+from ._co_common import _CUSTOM_OBJECTS_APP, _get_base_template, _register_tab_view, _restrict_or_warn, reference_q
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
 
@@ -45,13 +44,16 @@ _MAX_MULTIOBJECT_DISPLAY = 3
 
 def _iter_linked_fields(instance):
     """
-    Yield (field, model, filter_kwargs) for every CO field referencing instance.
+    Yield (field, model, q) for every CO field referencing instance, where ``q``
+    is a non-empty Q selecting the rows of that field's model that reference the
+    instance.
 
     Handles both non-polymorphic fields (single related_object_type FK) and
-    polymorphic fields (related_object_types M2M + is_polymorphic, introduced
-    in netbox-custom-objects 0.5.0). Mirrors the query shape in upstream's
-    CustomObjectLink.left_page so behaviour stays consistent with the
-    upstream "Custom Objects linking to this object" card.
+    polymorphic fields (related_object_types M2M + is_polymorphic, introduced in
+    netbox-custom-objects 0.5.0). The per-field filter is built by the shared
+    ``reference_q`` helper (see _co_common); fields whose Q comes back empty (an
+    unresolvable polymorphic through model) are skipped rather than yielded, so
+    callers never filter on an empty Q.
     """
     content_type = ContentType.objects.get_for_model(instance._meta.model)
     type_choices = [CustomFieldTypeChoices.TYPE_OBJECT, CustomFieldTypeChoices.TYPE_MULTIOBJECT]
@@ -78,37 +80,14 @@ def _iter_linked_fields(instance):
         except Exception:
             logger.exception('Could not get model for CustomObjectType %s', field.custom_object_type_id)
             continue
-
-        if field.type == CustomFieldTypeChoices.TYPE_OBJECT:
-            if field.is_polymorphic:
-                yield (
-                    field,
-                    model,
-                    {
-                        f'{field.name}_content_type_id': content_type.id,
-                        f'{field.name}_object_id': instance.pk,
-                    },
-                )
-            else:
-                yield field, model, {f'{field.name}_id': instance.pk}
-        elif field.type == CustomFieldTypeChoices.TYPE_MULTIOBJECT:
-            if field.is_polymorphic:
-                try:
-                    through = apps.get_model(_CUSTOM_OBJECTS_APP, field.through_model_name)
-                except LookupError:
-                    logger.exception(
-                        'Could not resolve through model %r for polymorphic field %s',
-                        field.through_model_name,
-                        field.pk,
-                    )
-                    continue
-                source_ids = through.objects.filter(
-                    content_type_id=content_type.id,
-                    object_id=instance.pk,
-                ).values('source_id')
-                yield field, model, {'pk__in': source_ids}
-            else:
-                yield field, model, {field.name: instance.pk}
+        q = reference_q(
+            content_type.id, instance.pk, field.name, field.type, field.is_polymorphic, field.through_model_name
+        )
+        if not q.children:
+            # Empty Q == "matches nothing" (unresolvable through model); skip it —
+            # filtering on an empty Q would match every row of this model.
+            continue
+        yield field, model, q
 
 
 def _get_linked_custom_objects(instance, user=None):
@@ -123,8 +102,8 @@ def _get_linked_custom_objects(instance, user=None):
     matches NetBox's general badge convention.
     """
     results = []
-    for field, model, filter_kwargs in _iter_linked_fields(instance):
-        qs = model.objects.filter(**filter_kwargs).prefetch_related('tags')
+    for field, model, q in _iter_linked_fields(instance):
+        qs = model.objects.filter(q).prefetch_related('tags')
         if user is not None:
             qs = _restrict_or_warn(qs, user, label=model._meta.label)
         for obj in qs:
@@ -139,8 +118,8 @@ def _count_linked_custom_objects(instance):
     Returns None (not 0) when count is zero so hide_if_empty=True works correctly.
     """
     total = 0
-    for _field, model, filter_kwargs in _iter_linked_fields(instance):
-        total += model.objects.filter(**filter_kwargs).count()
+    for _field, model, q in _iter_linked_fields(instance):
+        total += model.objects.filter(q).count()
     return total if total > 0 else None
 
 

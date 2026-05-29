@@ -2,7 +2,6 @@ import logging
 from collections import defaultdict
 from urllib.parse import urlencode
 
-from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from django.db.utils import OperationalError, ProgrammingError
@@ -19,62 +18,20 @@ from utilities.forms.fields import TagFilterField
 from utilities.views import ConditionalLoginRequiredMixin, ViewTab
 
 from ._co_common import (
-    _CUSTOM_OBJECTS_APP,
     _get_base_template,
     _register_tab_view,
     _restrict_or_warn,
+    reference_q,
 )
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
 
 
-def _build_q_for_field(host_ct_id, instance_pk, field_info):
-    """
-    Build a Q filter that selects custom-object rows of this type whose `field`
-    references the host (host_ct_id, instance_pk).
-
-    field_info = (name, type, label, is_polymorphic, through_model_name) — the
-    last two are only meaningful for polymorphic fields. Returns Q() (an empty
-    no-op filter) if the field can't be resolved, so callers can OR it safely.
-    """
-    field_name, field_type, _label, is_poly, through_model_name = field_info
-
-    if field_type == CustomFieldTypeChoices.TYPE_OBJECT:
-        if is_poly:
-            return Q(
-                **{
-                    f'{field_name}_content_type_id': host_ct_id,
-                    f'{field_name}_object_id': instance_pk,
-                }
-            )
-        return Q(**{f'{field_name}_id': instance_pk})
-
-    if field_type == CustomFieldTypeChoices.TYPE_MULTIOBJECT:
-        if is_poly:
-            try:
-                through = apps.get_model(_CUSTOM_OBJECTS_APP, through_model_name)
-            except LookupError:
-                logger.exception(
-                    'Could not resolve through model %r for polymorphic field %s',
-                    through_model_name,
-                    field_name,
-                )
-                return Q()
-            return Q(
-                pk__in=through.objects.filter(
-                    content_type_id=host_ct_id,
-                    object_id=instance_pk,
-                ).values('source_id')
-            )
-        return Q(**{field_name: instance_pk})
-
-    return Q()
-
-
 def _build_combined_q(host_ct_id, instance_pk, field_infos):
     """
     OR together the per-field reference filters for ``field_infos`` (the fields of
-    one Custom Object Type that reference the host).
+    one Custom Object Type that reference the host), using the shared ``reference_q``
+    helper (see _co_common).
 
     Returns the combined ``Q``, or ``None`` when no field produced a usable
     filter.  ``None`` means "matches nothing" — callers MUST short-circuit to
@@ -83,8 +40,8 @@ def _build_combined_q(host_ct_id, instance_pk, field_infos):
     """
     q_filter = Q()
     has_filter = False
-    for info in field_infos:
-        q = _build_q_for_field(host_ct_id, instance_pk, info)
+    for name, field_type, _label, is_poly, through_model_name in field_infos:
+        q = reference_q(host_ct_id, instance_pk, name, field_type, is_poly, through_model_name)
         if q.children:
             q_filter |= q
             has_filter = True

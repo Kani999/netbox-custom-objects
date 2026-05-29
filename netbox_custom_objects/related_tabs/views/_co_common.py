@@ -1,5 +1,8 @@
 import logging
 
+from django.apps import apps
+from django.db.models import Q
+from extras.choices import CustomFieldTypeChoices
 from netbox.registry import registry
 from utilities.views import register_model_view
 
@@ -31,6 +34,42 @@ def _restrict_or_warn(qs, user, *, label):
     except AttributeError:
         logger.warning('%s lacks restrict(user, view); per-row permission filter skipped', label)
         return qs
+
+
+def reference_q(host_ct_id, host_pk, field_name, field_type, is_polymorphic, through_model_name=None):
+    """
+    Build a Q selecting custom-object rows whose ``field_name`` references the host
+    object identified by (``host_ct_id``, ``host_pk``).  Single source of truth for
+    the four reference shapes shared by the combined and typed tab views:
+
+      * OBJECT, non-polymorphic      -> ``{name}_id``
+      * OBJECT, polymorphic          -> ``{name}_content_type_id`` + ``{name}_object_id``
+      * MULTIOBJECT, non-polymorphic -> ``{name}`` (reverse M2M)
+      * MULTIOBJECT, polymorphic     -> ``pk__in`` subquery over the field's through table
+
+    Returns an EMPTY ``Q()`` for an unsupported field type or an unresolvable
+    polymorphic through model.  Callers MUST treat an empty Q as "matches nothing /
+    skip" and never pass it to ``.filter()`` directly — ``filter(Q())`` matches
+    every row (an empty Q is the identity element for ``|``).
+    """
+    if field_type == CustomFieldTypeChoices.TYPE_OBJECT:
+        if is_polymorphic:
+            return Q(**{f'{field_name}_content_type_id': host_ct_id, f'{field_name}_object_id': host_pk})
+        return Q(**{f'{field_name}_id': host_pk})
+
+    if field_type == CustomFieldTypeChoices.TYPE_MULTIOBJECT:
+        if is_polymorphic:
+            try:
+                through = apps.get_model(_CUSTOM_OBJECTS_APP, through_model_name)
+            except LookupError:
+                logger.exception(
+                    'Could not resolve through model %r for polymorphic field %s', through_model_name, field_name
+                )
+                return Q()
+            return Q(pk__in=through.objects.filter(content_type_id=host_ct_id, object_id=host_pk).values('source_id'))
+        return Q(**{field_name: host_pk})
+
+    return Q()
 
 
 def _register_tab_view(model_class, name, path, view_factory):
