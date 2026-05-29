@@ -14,9 +14,9 @@ from netbox.tables import BaseTable
 from netbox_custom_objects.models import CustomObjectTypeField
 from utilities.htmx import htmx_partial
 from utilities.paginator import EnhancedPaginator, get_paginate_count
-from utilities.views import ConditionalLoginRequiredMixin, ViewTab, register_model_view
+from utilities.views import ConditionalLoginRequiredMixin, ViewTab
 
-from ._co_common import _CUSTOM_OBJECTS_APP, _get_base_template
+from ._co_common import _CUSTOM_OBJECTS_APP, _get_base_template, _register_tab_view, _restrict_or_warn
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
 
@@ -126,10 +126,7 @@ def _get_linked_custom_objects(instance, user=None):
     for field, model, filter_kwargs in _iter_linked_fields(instance):
         qs = model.objects.filter(**filter_kwargs).prefetch_related('tags')
         if user is not None:
-            try:
-                qs = qs.restrict(user, 'view')
-            except AttributeError:
-                pass
+            qs = _restrict_or_warn(qs, user, label=model._meta.label)
         for obj in qs:
             results.append((obj, field))
     return results
@@ -232,10 +229,7 @@ def _make_tab_view(model_class, label='Custom Objects', weight=2000):
 
                 cot = get_object_or_404(CustomObjectType, slug=co_slug)
                 actual_model = cot.get_model()
-            try:
-                qs = actual_model.objects.restrict(request.user, 'view')
-            except AttributeError:
-                qs = actual_model.objects.all()
+            qs = _restrict_or_warn(actual_model.objects.all(), request.user, label=actual_model._meta.label)
 
             instance = get_object_or_404(qs, pk=pk)
             linked_all = _get_linked_custom_objects(instance, user=request.user)
@@ -359,30 +353,10 @@ def register_combined_tabs(model_classes, label, weight):
     """
     Register a combined Custom Objects tab view for each model in the list.
     """
-    from netbox.registry import registry
-
     for model_class in model_classes:
-        app_label = model_class._meta.app_label
-        model_name = model_class._meta.model_name
-
-        # Skip if already registered (idempotent — guards against reloader re-runs).
-        existing = registry['views'].get(app_label, {}).get(model_name, [])
-        if any(e['name'] == 'custom_objects' for e in existing):
-            logger.debug(
-                'combined tab already registered for %s.%s — skipping',
-                app_label,
-                model_name,
-            )
-            continue
-
-        view_class = _make_tab_view(model_class, label=label, weight=weight)
-        register_model_view(
+        _register_tab_view(
             model_class,
-            name='custom_objects',
-            path='custom-objects',
-        )(view_class)
-        logger.debug(
-            'registered combined tab for %s.%s',
-            app_label,
-            model_name,
+            'custom_objects',
+            'custom-objects',
+            lambda: _make_tab_view(model_class, label=label, weight=weight),
         )

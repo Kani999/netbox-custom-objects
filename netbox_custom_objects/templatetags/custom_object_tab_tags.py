@@ -42,7 +42,6 @@ def plugin_extra_tabs(context, instance):
             if tab.permission and not user.has_perm(tab.permission):
                 continue
             if attrs := tab.render(instance):
-                active_tab = context.get('tab')
                 try:
                     url = get_action_url(instance, action=config['name'], kwargs={'pk': instance.pk})
                 except NoReverseMatch:
@@ -54,7 +53,7 @@ def plugin_extra_tabs(context, instance):
                         'label': attrs['label'],
                         'badge': attrs['badge'],
                         'weight': attrs['weight'],
-                        'is_active': active_tab and active_tab == tab,
+                        'is_active': context.get('tab') == tab,
                     }
                 )
 

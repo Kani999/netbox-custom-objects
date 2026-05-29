@@ -11,15 +11,19 @@ from django.urls import NoReverseMatch, reverse
 from django.views.generic import View
 from extras.choices import CustomFieldTypeChoices, CustomFieldUIVisibleChoices
 from netbox.forms import NetBoxModelFilterSetForm
-from netbox.registry import registry
 from netbox_custom_objects import field_types
 from netbox_custom_objects.filtersets import get_filterset_class
 from netbox_custom_objects.models import CustomObjectTypeField
 from netbox_custom_objects.tables import CustomObjectTable
 from utilities.forms.fields import TagFilterField
-from utilities.views import ConditionalLoginRequiredMixin, ViewTab, register_model_view
+from utilities.views import ConditionalLoginRequiredMixin, ViewTab
 
-from ._co_common import _CO_BASE_TEMPLATE, _CUSTOM_OBJECTS_APP, _get_base_template  # noqa: F401
+from ._co_common import (
+    _CUSTOM_OBJECTS_APP,
+    _get_base_template,
+    _register_tab_view,
+    _restrict_or_warn,
+)
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
 
@@ -65,6 +69,26 @@ def _build_q_for_field(host_ct_id, instance_pk, field_info):
         return Q(**{field_name: instance_pk})
 
     return Q()
+
+
+def _build_combined_q(host_ct_id, instance_pk, field_infos):
+    """
+    OR together the per-field reference filters for ``field_infos`` (the fields of
+    one Custom Object Type that reference the host).
+
+    Returns the combined ``Q``, or ``None`` when no field produced a usable
+    filter.  ``None`` means "matches nothing" — callers MUST short-circuit to
+    ``.none()`` / skip rather than passing an empty ``Q()`` to ``filter()``,
+    which would match every row (empty ``Q()`` is the identity element for ``|``).
+    """
+    q_filter = Q()
+    has_filter = False
+    for info in field_infos:
+        q = _build_q_for_field(host_ct_id, instance_pk, info)
+        if q.children:
+            q_filter |= q
+            has_filter = True
+    return q_filter if has_filter else None
 
 
 def _build_typed_table_class(custom_object_type, dynamic_model):
@@ -237,15 +261,8 @@ def _count_for_type(custom_object_type, field_infos, host_ct_id):
             )
             return None
 
-        q_filter = Q()
-        has_filter = False
-        for info in field_infos:
-            q = _build_q_for_field(host_ct_id, instance.pk, info)
-            if q.children:
-                q_filter |= q
-                has_filter = True
-
-        if not has_filter:
+        q_filter = _build_combined_q(host_ct_id, instance.pk, field_infos)
+        if q_filter is None:
             return None
 
         total = dynamic_model.objects.filter(q_filter).distinct().count()
@@ -274,9 +291,9 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
     def _visible(instance):
         """
         Defence-in-depth: re-check ``show_dedicated_tab`` from the DB per
-        render so a missed hot-reload (or a worker that hasn't yet picked
-        up the Redis version bump) can't leave a stale typed tab visible
-        after the COT has been flipped to show_dedicated_tab=False.
+        render so a missed hot-reload (or a worker that hasn't yet observed
+        the cache_timestamp snapshot drift) can't leave a stale typed tab
+        visible after the COT has been flipped to show_dedicated_tab=False.
 
         Cost: one indexed-PK read per visible tab per render.  Negligible
         compared with the badge query that already runs for each tab.
@@ -306,10 +323,7 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
         )
 
         def get(self, request, pk, **kwargs):
-            try:
-                qs = model_class.objects.restrict(request.user, 'view')
-            except AttributeError:
-                qs = model_class.objects.all()
+            qs = _restrict_or_warn(model_class.objects.all(), request.user, label=model_class._meta.label)
 
             instance = get_object_or_404(qs, pk=pk)
 
@@ -335,27 +349,16 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
                 return render(request, 'netbox_custom_objects/related_tabs/typed/tab.html', error_context)
 
             # Build base queryset: union of all field filters for this type.
-            # Polymorphic fields contribute Q(pk__in=<through subquery>) or a
-            # (content_type_id, object_id) pair, both handled by _build_q_for_field.
-            #
-            # An empty Q() is the identity element of `|`, so filter(Q()) returns
-            # ALL rows. Track has_filter (mirrors _count_for_type) and short-circuit
-            # to .none() if every _build_q_for_field call returned an empty Q —
-            # otherwise an unresolvable through model or unknown field type would
-            # silently widen the tab to every row of the target type.
-            q_filter = Q()
-            has_filter = False
-            for info in field_infos:
-                q = _build_q_for_field(host_ct_id, instance.pk, info)
-                if q.children:
-                    q_filter |= q
-                    has_filter = True
-
-            if has_filter:
-                try:
-                    base_qs = dynamic_model.objects.restrict(request.user, 'view').filter(q_filter).distinct()
-                except AttributeError:
-                    base_qs = dynamic_model.objects.filter(q_filter).distinct()
+            # _build_combined_q returns None ("matches nothing") when no field
+            # resolved, so we short-circuit to .none() rather than filtering on an
+            # empty Q (which would match every row of the target type).
+            q_filter = _build_combined_q(host_ct_id, instance.pk, field_infos)
+            if q_filter is not None:
+                base_qs = (
+                    _restrict_or_warn(dynamic_model.objects.all(), request.user, label=dynamic_model._meta.label)
+                    .filter(q_filter)
+                    .distinct()
+                )
             else:
                 base_qs = dynamic_model.objects.none()
 
@@ -529,26 +532,9 @@ def register_typed_tabs(model_classes, weight):
         custom_object_type = ct_cot_map[(ct_id, cot_pk)]
         slug = custom_object_type.slug
 
-        # Skip if already registered (idempotent — guards against reloader re-runs).
-        existing = registry['views'].get(model_class._meta.app_label, {}).get(model_class._meta.model_name, [])
-        if any(e['name'] == f'custom_objects_{slug}' for e in existing):
-            logger.debug(
-                "typed tab '%s' already registered for %s.%s — skipping",
-                slug,
-                model_class._meta.app_label,
-                model_class._meta.model_name,
-            )
-            continue
-
-        view_class = _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, ct_id)
-        register_model_view(
+        _register_tab_view(
             model_class,
-            name=f'custom_objects_{slug}',
-            path=f'custom-objects-{slug}',
-        )(view_class)
-        logger.debug(
-            "registered typed tab '%s' for %s.%s",
-            slug,
-            model_class._meta.app_label,
-            model_class._meta.model_name,
+            f'custom_objects_{slug}',
+            f'custom-objects-{slug}',
+            lambda: _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, ct_id),
         )
