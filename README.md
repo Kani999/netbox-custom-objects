@@ -46,6 +46,25 @@ PLUGINS_CONFIG = {
 }
 ```
 
+## Related Objects Tab
+
+When a Custom Object Type has an Object or Multi-object field that points at another model (a NetBox model such as Device or Site, or another Custom Object Type), a **Custom Objects** tab is added to the detail page of every referenced object. The tab lists all custom objects that link to the object being viewed, across every referencing field and type, with:
+
+- a badge showing the linked-object count (the tab hides itself when there are none),
+- search, plus type and tag filters, and sortable columns,
+- HTMX-driven pagination and per-user column configuration,
+- per-row edit/delete actions.
+
+Discovery is automatic and requires no configuration — both non-polymorphic and polymorphic Object/Multi-object fields are supported, on built-in NetBox models and on Custom Object Type detail pages (custom-object-to-custom-object references).
+
+The tab complements the existing **Custom Objects linking to this object** panel on the object's main page; both surface the same relationships, the tab as a dedicated, filterable list.
+
+### Caveats
+
+- **The tab is registered once, at startup.** Everyday changes are reflected live with no restart — creating custom objects, editing them, and references between custom object types (including a brand-new Custom Object Type pointing at another) all appear on the next page load.
+- **One case needs a NetBox restart:** the *first time* any Custom Object Type field references a built-in NetBox model that nothing referenced before (e.g. the first-ever reference to `dcim.rack`), that model's tab only appears after a restart. This is because NetBox builds each model's URL routes once at startup; subsequent references to an already-referenced model are live. References between custom object types are not affected and are always live.
+- **Badge count vs. visible rows:** the count in the tab badge is computed before per-Custom-Object-Type view permissions are applied, so a user without permission on a given type may see a count higher than the number of rows they can actually open.
+
 ## Known Limitations
 
 NetBox Custom Objects is now Generally Available which means you can use it in production and migrations to future versions will work. There are many upcoming features including GraphQL support - the best place to see what's on the way is the [issues](https://github.com/netboxlabs/netbox-custom-objects/issues) list on the GitHub repository.
