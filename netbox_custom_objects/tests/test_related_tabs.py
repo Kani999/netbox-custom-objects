@@ -11,6 +11,9 @@ Focused on the surfaces most likely to regress:
   rows (both non-polymorphic via ``related_object_type`` and polymorphic via the
   ``related_object_types`` M2M).
 * ``_resolve_model_classes()`` skips unknown ContentTypes and dedups.
+* ``custom_objects_tab_link`` renders the combined tab on a custom-object host
+  page LIVE from the DB, so a CustomObjectType created after startup (a CO→CO
+  reference) gets a tab with no NetBox restart and no startup registration.
 """
 
 from core.models import ObjectType
@@ -139,3 +142,72 @@ class ResolveModelClassesTests(TestCase):
         # Pass a deliberately-invalid CT id; should be skipped silently.
         result = _resolve_model_classes({-999999})
         self.assertEqual(result, [])
+
+
+class CoToCoLiveTabLinkTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
+    """
+    ``custom_objects_tab_link`` renders the combined tab on a custom-object host
+    page live from the DB — the CO→CO case the startup view registry can't cover.
+
+    Regression for the smoke-test S2 finding: a CustomObjectType (B) created after
+    startup that references another CustomObjectType (A) must surface a 'Custom
+    Objects' tab on A's detail page WITHOUT a restart and WITHOUT A's dynamic model
+    being in the startup view registry.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from django.contrib.auth import get_user_model
+        from netbox_custom_objects.related_tabs.registry import CO_COMBINED_URL_NAME, _inject_co_urls
+
+        # Inject the generic CO combined-tab URL exactly as ready() does at startup,
+        # so get_action_url() inside the tag can reverse it.  Idempotent.
+        _inject_co_urls()
+        self.url_name = CO_COMBINED_URL_NAME
+        self.user = get_user_model().objects.create_user(username='cotabtest', password='x')
+
+    def _build_a_referenced_by_b(self):
+        """Create COT A (+1 instance) and COT B with an Object field -> A linking to it."""
+        cot_a = self.create_custom_object_type(name='live_a', slug='live-a')
+        self.create_custom_object_type_field(cot_a, name='name', label='Name', type='text', primary=True)
+        model_a = cot_a.get_model()
+        a1 = model_a.objects.create(name='a-1')
+
+        cot_b = self.create_custom_object_type(name='live_b', slug='live-b')
+        self.create_custom_object_type_field(cot_b, name='name', label='Name', type='text', primary=True)
+        self.create_custom_object_type_field(
+            cot_b,
+            name='ref_a',
+            label='Ref A',
+            type=CustomFieldTypeChoices.TYPE_OBJECT,
+            is_polymorphic=False,
+            related_object_type=cot_a.object_type,
+        )
+        model_b = cot_b.get_model()
+        model_b.objects.create(name='b-1', ref_a=a1)
+        return a1
+
+    def _render_link(self, instance):
+        from netbox_custom_objects.templatetags.custom_object_tab_tags import custom_objects_tab_link
+
+        request = self.client.request().wsgi_request
+        request.user = self.user
+        # The inclusion tag reads context['request'] and context.get('tab').
+        return custom_objects_tab_link({'request': request, 'tab': None}, instance)
+
+    def test_link_rendered_for_co_referenced_by_another_cot(self):
+        a1 = self._build_a_referenced_by_b()
+        result = self._render_link(a1)
+        self.assertIsNotNone(result['tab'], 'combined tab link should render for a referenced custom object')
+        self.assertEqual(result['tab']['badge'], 1)
+        self.assertEqual(result['tab']['label'], 'Custom Objects')
+        # URL must reverse to the generic CO combined route for THIS slug.
+        self.assertIn('/custom-objects/', result['tab']['url'])
+
+    def test_no_link_when_unreferenced(self):
+        # A custom object that nothing references → badge 0 → no tab (hide_if_empty).
+        cot = self.create_custom_object_type(name='live_lonely', slug='live-lonely')
+        self.create_custom_object_type_field(cot, name='name', label='Name', type='text', primary=True)
+        lonely = cot.get_model().objects.create(name='lonely-1')
+        result = self._render_link(lonely)
+        self.assertIsNone(result['tab'], 'no tab should render when nothing links to the object')

@@ -15,7 +15,7 @@ from utilities.htmx import htmx_partial
 from utilities.paginator import EnhancedPaginator, get_paginate_count
 from utilities.views import ConditionalLoginRequiredMixin, ViewTab
 
-from ._co_common import _CUSTOM_OBJECTS_APP, _get_base_template, _register_tab_view, _restrict_or_warn, reference_q
+from ._co_common import _get_base_template, _register_tab_view, _restrict_or_warn, reference_q
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
 
@@ -185,11 +185,125 @@ def _sort_header(sort_base, col, current_sort, current_dir):
     return {'url': f'?{qs}', 'icon': icon}
 
 
+def _render_combined_tab(request, instance, tab):
+    """
+    Render the combined "Custom Objects" tab for ``instance`` (search / type /
+    tag filters, sort, HTMX pagination).  Shared by the built-in-host view
+    (``_make_tab_view``) and the generic custom-object-host view
+    (``make_co_combined_view``) so both render identically.
+    """
+    linked_all = _get_linked_custom_objects(instance, user=request.user)
+
+    # Build table object for column-preference machinery (no data, just column config)
+    tab_table = CustomObjectsTabTable([], empty_text='')
+    visible_cols = None
+    if request.user.is_authenticated and (userconfig := getattr(request.user, 'config', None)):
+        visible_cols = userconfig.get(f'tables.{tab_table.name}.columns')
+    if visible_cols is None:
+        visible_cols = list(CustomObjectsTabTable.Meta.default_columns)
+    tab_table._set_columns(visible_cols)
+    selected_columns = {col for col, _ in tab_table.selected_columns} | set(tab_table.exempt_columns)
+
+    # Collect unique types for the dropdown (always from the unfiltered list)
+    seen_type_pks = set()
+    available_types = []
+    for _obj, field in linked_all:
+        cot = field.custom_object_type
+        if cot.pk not in seen_type_pks:
+            seen_type_pks.add(cot.pk)
+            available_types.append(cot)
+    available_types.sort(key=lambda t: str(t))
+
+    # Read filter/sort params
+    q = request.GET.get('q', '')
+    type_slug = request.GET.get('type', '')
+    tag_slug = request.GET.get('tag', '').strip()
+    sort_col = request.GET.get('sort', '')
+    sort_dir = request.GET.get('dir', 'asc')
+    per_page = request.GET.get('per_page', '')
+
+    # Collect unique tags for the dropdown (always from the unfiltered list)
+    seen_tag_slugs = set()
+    available_tags = []
+    for _obj, _field in linked_all:
+        for t in _obj.tags.all():
+            if t.slug not in seen_tag_slugs:
+                seen_tag_slugs.add(t.slug)
+                available_tags.append(t)
+    available_tags.sort(key=lambda t: t.name.lower())
+
+    # Apply filters
+    linked = _filter_linked_objects(linked_all, q)
+    if type_slug:
+        linked = [(obj, field) for obj, field in linked if field.custom_object_type.slug == type_slug]
+    if tag_slug:
+        linked = [(obj, field) for obj, field in linked if tag_slug in {t.slug for t in obj.tags.all()}]
+
+    # In-memory sort (applied after filters, before pagination)
+    if sort_col in _SORT_KEYS:
+        linked.sort(key=_SORT_KEYS[sort_col], reverse=(sort_dir == 'desc'))
+
+    # Pagination
+    paginator = EnhancedPaginator(linked, get_paginate_count(request))
+    try:
+        page = paginator.page(int(request.GET.get('page', 1)))
+    except (InvalidPage, ValueError):
+        page = paginator.page(1)
+
+    # Resolve field values for just the current page (avoids N+1 on full list)
+    page_rows = [(obj, field, _get_field_value(obj, field)) for obj, field in page.object_list]
+
+    # Build the base query string (without sort/dir) for column sort links
+    base_params = {}
+    if q:
+        base_params['q'] = q
+    if type_slug:
+        base_params['type'] = type_slug
+    if tag_slug:
+        base_params['tag'] = tag_slug
+    if per_page:
+        base_params['per_page'] = per_page
+    sort_base = urlencode(base_params)
+
+    sort_headers = {col: _sort_header(sort_base, col, sort_col, sort_dir) for col in ('type', 'object', 'field')}
+
+    context = {
+        'object': instance,
+        'tab': tab,
+        # base_template must match the parent model's detail template
+        # so that tabs, breadcrumbs, and the page header render correctly.
+        'base_template': _get_base_template(instance),
+        'page_obj': page,
+        'paginator': paginator,
+        'page_rows': page_rows,
+        'q': q,
+        'type_slug': type_slug,
+        'tag_slug': tag_slug,
+        'available_types': available_types,
+        'available_tags': available_tags,
+        'sort': sort_col,
+        'sort_dir': sort_dir,
+        'sort_headers': sort_headers,
+        'htmx_table': SimpleNamespace(htmx_url=request.path, embedded=False),
+        'return_url': request.get_full_path(),
+        'tab_table': tab_table,
+        'selected_columns': selected_columns,
+    }
+
+    if htmx_partial(request):
+        return render(request, 'netbox_custom_objects/related_tabs/combined/tab_partial.html', context)
+    return render(request, 'netbox_custom_objects/related_tabs/combined/tab.html', context)
+
+
 def _make_tab_view(model_class, label='Custom Objects', weight=2000):
     """
-    Factory that returns a unique View subclass for model_class.
-    Each model needs its own class so that NetBox's view registry stores
-    separate entries and URL names do not collide.
+    Factory that returns a unique View subclass for a built-in (non custom-object)
+    host model.  Each model needs its own class so that NetBox's view registry
+    stores separate entries and URL names do not collide.
+
+    Custom-object host pages do NOT use this — they are served by the generic,
+    slug-resolving ``make_co_combined_view`` so a brand-new CustomObjectType gets
+    a live tab without startup registration.
     """
 
     class _TabView(ConditionalLoginRequiredMixin, View):
@@ -201,131 +315,48 @@ def _make_tab_view(model_class, label='Custom Objects', weight=2000):
         )
 
         def get(self, request, pk, **kwargs):
-            actual_model = model_class
-            co_slug = kwargs.get('custom_object_type')
-            if co_slug and model_class._meta.app_label == _CUSTOM_OBJECTS_APP:
-                from netbox_custom_objects.models import CustomObjectType
-
-                cot = get_object_or_404(CustomObjectType, slug=co_slug)
-                actual_model = cot.get_model()
-            qs = _restrict_or_warn(actual_model.objects.all(), request.user, label=actual_model._meta.label)
-
+            qs = _restrict_or_warn(model_class.objects.all(), request.user, label=model_class._meta.label)
             instance = get_object_or_404(qs, pk=pk)
-            linked_all = _get_linked_custom_objects(instance, user=request.user)
-
-            # Build table object for column-preference machinery (no data, just column config)
-            tab_table = CustomObjectsTabTable([], empty_text='')
-            visible_cols = None
-            if request.user.is_authenticated and (userconfig := getattr(request.user, 'config', None)):
-                visible_cols = userconfig.get(f'tables.{tab_table.name}.columns')
-            if visible_cols is None:
-                visible_cols = list(CustomObjectsTabTable.Meta.default_columns)
-            tab_table._set_columns(visible_cols)
-            selected_columns = {col for col, _ in tab_table.selected_columns} | set(tab_table.exempt_columns)
-
-            # Collect unique types for the dropdown (always from the unfiltered list)
-            seen_type_pks = set()
-            available_types = []
-            for _obj, field in linked_all:
-                cot = field.custom_object_type
-                if cot.pk not in seen_type_pks:
-                    seen_type_pks.add(cot.pk)
-                    available_types.append(cot)
-            available_types.sort(key=lambda t: str(t))
-
-            # Read filter/sort params
-            q = request.GET.get('q', '')
-            type_slug = request.GET.get('type', '')
-            tag_slug = request.GET.get('tag', '').strip()
-            sort_col = request.GET.get('sort', '')
-            sort_dir = request.GET.get('dir', 'asc')
-            per_page = request.GET.get('per_page', '')
-
-            # Collect unique tags for the dropdown (always from the unfiltered list)
-            seen_tag_slugs = set()
-            available_tags = []
-            for _obj, _field in linked_all:
-                for t in _obj.tags.all():
-                    if t.slug not in seen_tag_slugs:
-                        seen_tag_slugs.add(t.slug)
-                        available_tags.append(t)
-            available_tags.sort(key=lambda t: t.name.lower())
-
-            # Apply filters
-            linked = _filter_linked_objects(linked_all, q)
-            if type_slug:
-                linked = [(obj, field) for obj, field in linked if field.custom_object_type.slug == type_slug]
-            if tag_slug:
-                linked = [(obj, field) for obj, field in linked if tag_slug in {t.slug for t in obj.tags.all()}]
-
-            # In-memory sort (applied after filters, before pagination)
-            if sort_col in _SORT_KEYS:
-                linked.sort(key=_SORT_KEYS[sort_col], reverse=(sort_dir == 'desc'))
-
-            # Pagination
-            paginator = EnhancedPaginator(linked, get_paginate_count(request))
-            try:
-                page = paginator.page(int(request.GET.get('page', 1)))
-            except (InvalidPage, ValueError):
-                page = paginator.page(1)
-
-            # Resolve field values for just the current page (avoids N+1 on full list)
-            page_rows = [(obj, field, _get_field_value(obj, field)) for obj, field in page.object_list]
-
-            # Build the base query string (without sort/dir) for column sort links
-            base_params = {}
-            if q:
-                base_params['q'] = q
-            if type_slug:
-                base_params['type'] = type_slug
-            if tag_slug:
-                base_params['tag'] = tag_slug
-            if per_page:
-                base_params['per_page'] = per_page
-            sort_base = urlencode(base_params)
-
-            sort_headers = {
-                col: _sort_header(sort_base, col, sort_col, sort_dir) for col in ('type', 'object', 'field')
-            }
-
-            context = {
-                'object': instance,
-                'tab': self.tab,
-                # base_template must match the parent model's detail template
-                # so that tabs, breadcrumbs, and the page header render correctly.
-                'base_template': _get_base_template(instance),
-                'page_obj': page,
-                'paginator': paginator,
-                'page_rows': page_rows,
-                'q': q,
-                'type_slug': type_slug,
-                'tag_slug': tag_slug,
-                'available_types': available_types,
-                'available_tags': available_tags,
-                'sort': sort_col,
-                'sort_dir': sort_dir,
-                'sort_headers': sort_headers,
-                'htmx_table': SimpleNamespace(htmx_url=request.path, embedded=False),
-                'return_url': request.get_full_path(),
-                'tab_table': tab_table,
-                'selected_columns': selected_columns,
-            }
-
-            if htmx_partial(request):
-                return render(
-                    request,
-                    'netbox_custom_objects/related_tabs/combined/tab_partial.html',
-                    context,
-                )
-            return render(
-                request,
-                'netbox_custom_objects/related_tabs/combined/tab.html',
-                context,
-            )
+            return _render_combined_tab(request, instance, self.tab)
 
     _TabView.__name__ = f'{model_class.__name__}CustomObjectsTabView'
     _TabView.__qualname__ = f'{model_class.__name__}CustomObjectsTabView'
     return _TabView
+
+
+def make_co_combined_view(label='Custom Objects', weight=2000):
+    """
+    Return the combined-tab view for *custom-object* host pages.
+
+    Unlike ``_make_tab_view`` (one class per built-in model, registered at
+    startup), this single view resolves the target CustomObjectType from the
+    ``custom_object_type`` slug in the URL at request time.  Its URL is injected
+    once, unconditionally, at startup (``registry._inject_co_urls``) and accepts
+    any slug — so a CustomObjectType created *after* startup still has a working,
+    reversible tab URL.  The nav-link itself is rendered live from the DB by the
+    ``custom_objects_tab_link`` template tag on the custom-object detail page,
+    not from the startup view registry — that's what makes CO→CO references live
+    without a restart.
+    """
+
+    class _COCombinedTabView(ConditionalLoginRequiredMixin, View):
+        tab = ViewTab(
+            label=label,
+            badge=_count_linked_custom_objects,
+            weight=weight,
+            hide_if_empty=True,
+        )
+
+        def get(self, request, custom_object_type, pk, **kwargs):
+            from netbox_custom_objects.models import CustomObjectType
+
+            cot = get_object_or_404(CustomObjectType, slug=custom_object_type)
+            actual_model = cot.get_model()
+            qs = _restrict_or_warn(actual_model.objects.all(), request.user, label=actual_model._meta.label)
+            instance = get_object_or_404(qs, pk=pk)
+            return _render_combined_tab(request, instance, self.tab)
+
+    return _COCombinedTabView
 
 
 def register_combined_tabs(model_classes, label, weight):

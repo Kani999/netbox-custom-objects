@@ -61,8 +61,8 @@ The tab complements the existing **Custom Objects linking to this object** panel
 
 ### Caveats
 
-- **The tab is registered once, at startup.** Everyday changes are reflected live with no restart — creating custom objects, editing them, and references between custom object types (including a brand-new Custom Object Type pointing at another) all appear on the next page load.
-- **One case needs a NetBox restart:** the *first time* any Custom Object Type field references a built-in NetBox model that nothing referenced before (e.g. the first-ever reference to `dcim.rack`), that model's tab only appears after a restart. This is because NetBox builds each model's URL routes once at startup; subsequent references to an already-referenced model are live. References between custom object types are not affected and are always live.
+- **References between custom object types are always live.** A brand-new Custom Object Type that points at another shows the tab on the referenced type's pages on the next page load, with no restart — custom object detail pages render the tab live from the database. Creating and editing custom objects is likewise always live.
+- **One case needs a NetBox restart:** the *first time* any Custom Object Type field references a **built-in NetBox model** that nothing referenced before (e.g. the first-ever reference to `dcim.rack`), that model's tab only appears after a restart. This is because NetBox builds each built-in model's URL routes once at startup; subsequent references to an already-referenced built-in model are live.
 - **Badge count vs. visible rows:** the count in the tab badge is computed before per-Custom-Object-Type view permissions are applied, so a user without permission on a given type may see a count higher than the number of rows they can actually open.
 
 ## Known Limitations

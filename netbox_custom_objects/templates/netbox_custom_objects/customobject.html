@@ -74,7 +74,12 @@
     <li class="nav-item">
       <a class="nav-link{% if not tab %} active{% endif %}" href="{{ object.get_absolute_url }}">{{ object.custom_object_type.get_verbose_name }}</a>
     </li>
-    {# Combined "Custom Objects" tab auto-registered by related_tabs.registry; Journal/Changelog filtered out by the templatetag because they are rendered as hardcoded <li> below. #}
+    {# Combined "Custom Objects" tab — rendered live from the DB (not the startup
+       view registry) so a brand-new CustomObjectType referencing this one (CO→CO)
+       gets a tab without a NetBox restart. #}
+    {% custom_objects_tab_link object %}
+    {# Any other registered model-view tabs; custom_objects + journal + changelog
+       are excluded by the tag (they are rendered by hand here). #}
     {% plugin_extra_tabs object %}
     <li class="nav-item">
       <a class="nav-link{% if tab == 'journal' %} active{% endif %}" href="{% url 'plugins:netbox_custom_objects:customobject_journal' object.custom_object_type.slug object.pk %}">{% trans "Journal" %}</a>

@@ -1,55 +1,55 @@
 import logging
 
-from .views._co_common import _CUSTOM_OBJECTS_APP
-from .views.combined import register_combined_tabs
+from .views.combined import make_co_combined_view, register_combined_tabs
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
+
+# Action name / path / URL name for the combined tab on custom-object host pages.
+# Kept in sync with the hardcoded <li> in customobject.html and the
+# custom_objects_tab_link template tag.
+_CO_COMBINED_ACTION = 'custom_objects'
+_CO_COMBINED_PATH = 'custom-objects'
+# CustomObject._get_viewname('custom_objects') ->
+# 'plugins:netbox_custom_objects:customobject_custom_objects'
+CO_COMBINED_URL_NAME = f'customobject_{_CO_COMBINED_ACTION}'
 
 
 def _inject_co_urls():
     """
-    Inject URL patterns for our tab views into netbox_custom_objects.urls.
+    Inject the generic combined-tab URL for custom-object host pages into
+    ``netbox_custom_objects.urls``.
 
     The netbox_custom_objects plugin serves all custom object detail pages through a
     single generic view at ``<str:custom_object_type>/<int:pk>/``.  It never calls
-    ``get_model_urls()`` for dynamic models, so our registered views have no
-    corresponding URL patterns.  We add them here at ready() time — before Django
-    loads the URL conf on the first request.
+    ``get_model_urls()`` for dynamic models, so our tab view has no corresponding
+    URL pattern.  We add ONE generic, slug-parameterised pattern here at ready()
+    time — before Django loads the URL conf on the first request.
 
-    The URL names follow CustomObject._get_viewname():
-      ``plugins:netbox_custom_objects:customobject_{action}``
-    which means we need a name like ``customobject_custom_objects`` inside
-    netbox_custom_objects.urls.
+    Crucially this is a single COT-agnostic route (the slug is a path parameter),
+    not one route per CustomObjectType.  It therefore reverses for *any* slug,
+    including CustomObjectTypes created after startup — which is what lets the
+    combined tab appear on a brand-new CO→CO reference with no restart.  The
+    nav-link is rendered live by the ``custom_objects_tab_link`` template tag;
+    this function only guarantees the link target resolves.
+
+    The URL name follows CustomObject._get_viewname():
+      ``plugins:netbox_custom_objects:customobject_custom_objects``
     """
     try:
         import netbox_custom_objects.urls as co_urls
         from django.urls import path as url_path
-        from netbox.registry import registry
     except ImportError:
         return
 
-    co_app = _CUSTOM_OBJECTS_APP
-    # Collect all tab view classes our plugin registered for CO dynamic models
-    # from the global registry, keyed by their action name.
-    co_views_by_name = {}  # action_name -> (path, view_class)
-    for model_name, view_entries in registry['views'].get(co_app, {}).items():
-        if not model_name.startswith('table'):
-            continue
-        for entry in view_entries:
-            name = entry['name']
-            view_cls = entry['view']
-            # Only inject views we registered (combined tab view)
-            if name.startswith('custom_objects') and name not in co_views_by_name:
-                co_views_by_name[name] = (entry['path'], view_cls)
-
     existing_names = {p.name for p in co_urls.urlpatterns if hasattr(p, 'name') and p.name}
-    for action_name, (url_path_str, view_cls) in co_views_by_name.items():
-        url_name = f'customobject_{action_name}'
-        if url_name in existing_names:
-            continue
-        full_path = f'<str:custom_object_type>/<int:pk>/{url_path_str}/'
-        co_urls.urlpatterns.append(url_path(full_path, view_cls.as_view(), name=url_name))
-        logger.debug("injected URL pattern '%s'", url_name)
+    if CO_COMBINED_URL_NAME in existing_names:
+        return
+
+    full_path = f'<str:custom_object_type>/<int:pk>/{_CO_COMBINED_PATH}/'
+    co_urls.urlpatterns.append(
+        url_path(full_path, make_co_combined_view().as_view(), name=CO_COMBINED_URL_NAME)
+    )
+    logger.debug("injected URL pattern '%s'", CO_COMBINED_URL_NAME)
 
 
 def _deduplicate_registry():
@@ -195,6 +195,13 @@ def register_tabs():
     ``manage.py migrate`` on a fresh DB doesn't blow up; tabs come up on the
     next process start once migrations have applied.
     """
+    # Inject the generic custom-object combined-tab URL unconditionally and
+    # first.  It is a single COT-agnostic route, so it must exist at startup
+    # (the URLconf freezes after ready()) to serve combined tabs on custom-object
+    # host pages — including CustomObjectTypes created later (CO→CO references).
+    # This does not depend on any CO being a *referenced* host at startup.
+    _inject_co_urls()
+
     ct_ids = _discover_target_content_type_ids()
     if not ct_ids:
         # Either the DB is not ready or no COT fields reference anything yet.
@@ -204,9 +211,12 @@ def register_tabs():
     if not model_classes:
         return
 
+    # Built-in (non custom-object) host models get a per-model registry entry +
+    # per-model URL (via NetBox's get_model_urls at URLconf-build time), so a
+    # brand-new built-in target still needs a restart.  Custom-object hosts are
+    # served by the generic URL above + the live template-tag link, so they do
+    # not.  Registering the combined view here for CO models too is harmless
+    # (it shares the generic URL) and keeps the type-filter discovery uniform.
     register_combined_tabs(model_classes, _COMBINED_LABEL, _COMBINED_WEIGHT)
-
-    if any(m._meta.app_label == _CUSTOM_OBJECTS_APP for m in model_classes):
-        _inject_co_urls()
 
     _deduplicate_registry()
