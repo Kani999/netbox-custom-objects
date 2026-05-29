@@ -296,7 +296,35 @@ class CustomObjectsPluginConfig(PluginConfig):
         from django.apps import apps as django_apps
         django_apps.clear_cache()
 
+        # super().ready() is PluginConfig.ready(), which calls
+        # netbox.models.features.register_models(*self.get_models()) — that's
+        # what adds the changelog/journal/jobs/etc. view entries to
+        # registry['views'] for every NetBoxModel subclass in this plugin.
+        # register_tabs() below triggers netbox_custom_objects/urls.py to load
+        # (via _inject_co_urls()), and urls.py snapshots registry['views'] via
+        # get_model_urls() at import time.  Running register_tabs() before
+        # super().ready() would load urls.py with an incomplete registry and
+        # break reverse() for every NetBoxModel feature URL on CustomObject.
         super().ready()
+
+        # Register the combined "Custom Objects" related-object tab.  This runs
+        # once, at startup, before Django freezes the root URLconf on the first
+        # request — see netbox_custom_objects/related_tabs/__init__.py for why
+        # registration must happen here and the restart trade-off it implies.
+        try:
+            from django.urls import clear_url_caches
+            from netbox_custom_objects.related_tabs.registry import register_tabs
+            register_tabs()
+            # register_tabs() mutates netbox_custom_objects.urls.urlpatterns via
+            # _inject_co_urls(); drop any URL resolver caches built by
+            # super().ready() / other plugins so reverse() resolves against the
+            # patched patterns.
+            clear_url_caches()
+        except Exception:
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).exception(
+                "related_tabs.register_tabs() failed; continuing without tabs"
+            )
 
     def get_model(self, model_name, require_ready=True):
         self.apps.check_apps_ready()
