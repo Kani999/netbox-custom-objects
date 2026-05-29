@@ -2437,15 +2437,20 @@ def clear_cache_on_custom_object_type_save(sender, instance, **kwargs):
 
 
 @receiver(m2m_changed, sender=CustomObjectTypeField.related_object_types.through)
-def check_polymorphic_recursion(sender, instance, action, pk_set, **kwargs):
+def check_polymorphic_recursion(sender, instance, action, pk_set, reverse, **kwargs):
     """
     Prevent circular references in polymorphic field allowed-type lists.
 
     clean() cannot check this because related_object_types is a M2M that is set
     after the instance is saved.  m2m_changed fires on pre_add, which lets us abort
     the operation before any rows are written.
+
+    Reverse-side mutations (``object_type.polymorphic_custom_object_type_fields.add(...)``)
+    fire the same signal with ``instance`` being an ``ObjectType`` rather than a
+    ``CustomObjectTypeField``; this receiver's invariants don't apply there and
+    the ObjectType has no ``custom_object_type`` attribute, so bail out early.
     """
-    if action != "pre_add" or not pk_set:
+    if reverse or action != "pre_add" or not pk_set:
         return
 
     own_object_type_id = instance.custom_object_type.object_type_id
@@ -2466,6 +2471,64 @@ def check_polymorphic_recursion(sender, instance, action, pk_set, **kwargs):
                     "create a circular dependency between custom object types."
                 )
             )
+
+
+@receiver(m2m_changed, sender=CustomObjectTypeField.related_object_types.through)
+def bump_cot_cache_timestamp_on_m2m_change(sender, instance, action, reverse, **kwargs):
+    """
+    Bump the parent COT's cache_timestamp when a polymorphic field's allowed-type
+    M2M (``related_object_types``) changes outside the normal ``field.save()`` path.
+
+    Defence-in-depth: the UI form disables this M2M for existing field instances
+    (``forms.py``) and ``CustomObjectTypeFieldSerializer.validate()`` rejects
+    changes via the REST API (``api/serializers.py``).  This receiver covers
+    direct mutation paths that bypass ``field.save()`` — Django shell sessions,
+    ad-hoc scripts, or migration data fixups that call ``.add()`` / ``.remove()``
+    / ``.set()`` on the M2M descriptor without re-saving the parent field.
+    Without this bump, peer workers would not observe the M2M target change
+    because ``cache_timestamp`` would not have advanced; the model cache, the
+    related-tabs registry, and any other consumer of the cache_timestamp
+    invariant would all silently desynchronise.
+
+    Forward direction (``instance`` is a ``CustomObjectTypeField``,
+    ``reverse=False``): bump the parent COT's ``cache_timestamp`` directly.
+
+    Reverse direction (``instance`` is an ``ObjectType``, ``reverse=True``):
+    the affected fields are in ``pk_set`` for post_add / post_remove; iterate
+    them and bump each field's parent COT.  For post_clear ``pk_set`` is
+    None — the through rows are already gone so we can't recover which fields
+    were affected — log a warning so operators know to restart workers or
+    trigger a refresh via a manual COT save.  Django does NOT mirror the
+    forward signal on reverse-side calls, so this branch is the only chance
+    to invalidate.
+
+    Initial field creation through the API does NOT depend on this receiver:
+    ``field.save()`` bumps ``cache_timestamp`` first, and the subsequent M2M
+    write is wrapped in the same ``transaction.atomic()`` by the serializer's
+    ``create()`` so peer workers observe both atomically at commit time.
+    """
+    if action not in {'post_add', 'post_remove', 'post_clear'}:
+        return
+    if not reverse:
+        instance.custom_object_type.save(update_fields=['cache_timestamp'])
+        return
+    pks = kwargs.get('pk_set') or ()
+    if not pks:
+        # post_clear in reverse — through rows already gone, pk_set unavailable.
+        logger.warning(
+            'related_object_types %s observed from reverse direction; '
+            'cache_timestamp not bumped (no pk_set). '
+            'Save any CustomObjectType to recover cross-worker sync.',
+            action,
+        )
+        return
+    affected_cot_ids = set(
+        CustomObjectTypeField.objects.filter(pk__in=pks).values_list(
+            'custom_object_type_id', flat=True
+        )
+    )
+    for cot in CustomObjectType.objects.filter(pk__in=affected_cot_ids):
+        cot.save(update_fields=['cache_timestamp'])
 
 
 @receiver(post_save, sender=CustomObjectTypeField)

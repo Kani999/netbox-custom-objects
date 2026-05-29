@@ -65,6 +65,104 @@ class SchemaOperationsTestCase(TransactionCleanupMixin, CustomObjectsTestCase, T
             "cache_timestamp must be updated after a field is deleted.",
         )
 
+    def test_cache_invalidation_on_m2m_related_object_types_change(self):
+        """
+        Direct mutation of CustomObjectTypeField.related_object_types via the
+        M2M descriptor (e.g. shell scripts, migration data fixups) bumps the
+        parent COT's cache_timestamp.
+
+        Covers the ``bump_cot_cache_timestamp_on_m2m_change`` receiver in
+        models.py.  Without that receiver, post_add / post_remove / post_clear
+        events would not advance cache_timestamp, and peer workers reading
+        the (MAX(cache_timestamp), COUNT(*)) token would silently miss the
+        change.
+        """
+        from core.models import ObjectType
+        from dcim.models import Site
+        from extras.choices import CustomFieldTypeChoices
+
+        cot = self.create_custom_object_type(name='m2mcache', slug='m2m-cache')
+        field = self.create_custom_object_type_field(
+            cot,
+            name='related_poly',
+            label='Related Poly',
+            type=CustomFieldTypeChoices.TYPE_OBJECT,
+            is_polymorphic=True,
+        )
+
+        cot.refresh_from_db()
+        timestamp_after_create = cot.cache_timestamp
+
+        # post_add path — related_object_types is an M2M to core.ObjectType
+        # (a strict subclass of ContentType in NetBox).
+        site_ot = ObjectType.objects.get_for_model(Site)
+        field.related_object_types.add(site_ot)
+
+        cot.refresh_from_db()
+        self.assertNotEqual(
+            cot.cache_timestamp,
+            timestamp_after_create,
+            "cache_timestamp must advance after related_object_types.add().",
+        )
+        timestamp_after_add = cot.cache_timestamp
+
+        # post_remove path
+        field.related_object_types.remove(site_ot)
+
+        cot.refresh_from_db()
+        self.assertNotEqual(
+            cot.cache_timestamp,
+            timestamp_after_add,
+            "cache_timestamp must advance after related_object_types.remove().",
+        )
+
+    def test_reverse_m2m_mutation_does_not_crash_and_bumps_cache_timestamp(self):
+        """
+        Reverse-side M2M mutations (object_type.polymorphic_custom_object_type_fields.add)
+        must not crash, and must bump cache_timestamp on the affected fields'
+        parent COTs.  Regression for two latent AttributeError bugs in
+        check_polymorphic_recursion and bump_cot_cache_timestamp_on_m2m_change
+        when ``instance`` is an ObjectType rather than a CustomObjectTypeField.
+        """
+        from core.models import ObjectType
+        from dcim.models import Site
+        from extras.choices import CustomFieldTypeChoices
+
+        cot = self.create_custom_object_type(name='m2mrev', slug='m2m-rev')
+        field = self.create_custom_object_type_field(
+            cot,
+            name='poly_rev',
+            label='Poly Rev',
+            type=CustomFieldTypeChoices.TYPE_OBJECT,
+            is_polymorphic=True,
+        )
+
+        cot.refresh_from_db()
+        timestamp_before = cot.cache_timestamp
+
+        # Reverse-side add — formerly crashed with
+        # AttributeError: 'ObjectType' object has no attribute 'custom_object_type'.
+        site_ot = ObjectType.objects.get_for_model(Site)
+        site_ot.polymorphic_custom_object_type_fields.add(field)
+
+        cot.refresh_from_db()
+        self.assertNotEqual(
+            cot.cache_timestamp,
+            timestamp_before,
+            "cache_timestamp must advance after a reverse-side M2M add().",
+        )
+        timestamp_after_add = cot.cache_timestamp
+
+        # Reverse-side remove — same crash class, same expected behaviour.
+        site_ot.polymorphic_custom_object_type_fields.remove(field)
+
+        cot.refresh_from_db()
+        self.assertNotEqual(
+            cot.cache_timestamp,
+            timestamp_after_add,
+            "cache_timestamp must advance after a reverse-side M2M remove().",
+        )
+
     # ------------------------------------------------------------------
     # Model registry
     # ------------------------------------------------------------------

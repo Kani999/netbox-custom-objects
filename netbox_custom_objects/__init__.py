@@ -136,12 +136,13 @@ class CustomObjectsPluginConfig(PluginConfig):
 
     # NetBox appends each plugin's middleware list to the global MIDDLEWARE
     # setting at startup (see netbox/settings.py around the
-    # plugin_config.middleware line).  This middleware checks the
-    # Redis-shared tab-registry version on every request and refreshes our
-    # local registry when another process has mutated it, so
-    # CustomObjectType / CustomObjectTypeField changes (including
-    # show_dedicated_tab toggles) propagate across WSGI worker processes
-    # without requiring a NetBox restart.
+    # plugin_config.middleware line).  This middleware reads the
+    # (MAX(cache_timestamp), COUNT(*)) snapshot over CustomObjectType on
+    # every request and refreshes our local registry when another process
+    # has mutated state, so CustomObjectType / CustomObjectTypeField changes
+    # (including show_dedicated_tab toggles and polymorphic field target
+    # mutations) propagate across WSGI worker processes without requiring
+    # a NetBox restart.  No Redis or other shared cache backend is involved.
     middleware = [
         "netbox_custom_objects.related_tabs.middleware.TabRegistryRefreshMiddleware",
     ]
@@ -246,6 +247,33 @@ class CustomObjectsPluginConfig(PluginConfig):
         # Patch ObjectSelectorView to support dynamically-generated custom object models
         _patch_object_selector_view()
 
+        # Wire related_tabs hot-reload signals unconditionally.
+        #
+        # The signal handlers only reference the static models
+        # (CustomObjectType / CustomObjectTypeField), so they are safe to
+        # connect regardless of the dynamic-model lifecycle.  Connecting here
+        # — before any of the should_skip_dynamic_model_creation() branches —
+        # means signal-driven tests work without sniffing sys.argv, and
+        # production hot-reload is wired in one consistent place across every
+        # startup branch (normal, test, migrate, makemigrations, collectstatic,
+        # mid-migration recovery).
+        #
+        # Safety during migrate: handlers schedule force_local_refresh via
+        # ``transaction.on_commit``, so a rolled-back save can't leak a
+        # registry mutation.  ``_do_refresh`` -> ``register_tabs`` ->
+        # ``_discover_target_content_type_ids`` already swallows
+        # OperationalError / ProgrammingError during migrations.  Worst case
+        # if a data migration saves a COT: one wasted refresh + a "database
+        # unavailable" warning log.  No crash, no schema corruption.
+        try:
+            from netbox_custom_objects.related_tabs.signals import connect as connect_related_tabs_signals
+            connect_related_tabs_signals()
+        except Exception:
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).exception(
+                "related_tabs.signals.connect() failed; hot-reload disabled, restart required after COT changes"
+            )
+
         # Suppress warnings about database calls during app initialization
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -255,7 +283,9 @@ class CustomObjectsPluginConfig(PluginConfig):
                 "ignore", category=UserWarning, message=".*database.*"
             )
 
-            # Skip database calls if dynamic models can't be created yet
+            # Skip database calls if dynamic models can't be created yet.
+            # related_tabs signals were already connected above
+            # (unconditionally), so no per-skip-path wiring is needed.
             if self.should_skip_dynamic_model_creation():
                 super().ready()
                 return
@@ -338,36 +368,25 @@ class CustomObjectsPluginConfig(PluginConfig):
                 "related_tabs.register_tabs() failed; continuing without tabs"
             )
 
-        # Seed the Redis-shared registry version after the initial
-        # registration so a later Redis flush + process restart doesn't
-        # leave the cluster in a "remote == 0 <= local == N" steady state
-        # where processes permanently skip refreshing.  ``cache.add`` is a
-        # no-op if the key already exists, so this is safe to run on
-        # every startup.  Also align this process's local version with
-        # the (seeded or existing) Redis value so the first request served
-        # doesn't trigger a redundant full refresh on every cold start.
+        # Snapshot the current cache_timestamp / count token after the
+        # initial register_tabs() so the first request served by this
+        # process doesn't trigger a redundant full refresh in
+        # TabRegistryRefreshMiddleware.  Without this, _last_seen_state
+        # is None and the first comparison always misses.  Signals were
+        # connected at the top of ready() (unconditionally), so any
+        # concurrent COT save between register_tabs() and seed_local_state()
+        # — e.g. from another plugin's ready() — is observed by the signal
+        # handler and force_local_refresh updates the snapshot rather than
+        # leaving us with a state we'll never know diverged.  Failures here
+        # are logged and swallowed — a worst-case extra refresh on the
+        # next request is harmless.
         try:
-            from django.core.cache import cache
-            from netbox_custom_objects import related_tabs as _rt
-            cache.add(_rt._REDIS_KEY, 1, timeout=None)
-            _rt._tab_registry_version = _rt._get_remote_version()
+            from netbox_custom_objects.related_tabs import seed_local_state
+            seed_local_state()
         except Exception:
             import logging  # noqa: PLC0415
             logging.getLogger(__name__).exception(
-                "related_tabs Redis key seed failed; hot-reload may be unreliable after a Redis flush"
-            )
-
-        # Wire the post_save/post_delete signal handlers that drive hot-reload.
-        # Must run after register_tabs() so the initial registration is already
-        # in place — otherwise a save fired during startup would race against
-        # the initial register_tabs() call inside _do_refresh().
-        try:
-            from netbox_custom_objects.related_tabs.signals import connect as connect_related_tabs_signals
-            connect_related_tabs_signals()
-        except Exception:
-            import logging  # noqa: PLC0415
-            logging.getLogger(__name__).exception(
-                "related_tabs.signals.connect() failed; hot-reload disabled, restart required after COT changes"
+                "related_tabs.seed_local_state() failed; first request will trigger an extra refresh"
             )
 
     def get_model(self, model_name, require_ready=True):

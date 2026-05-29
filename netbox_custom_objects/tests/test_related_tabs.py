@@ -11,16 +11,19 @@ Focused on the surfaces most likely to regress:
   no duplicates and no lost upstream entries.
 * ``ViewTab.visible()`` defence-in-depth predicate — re-reads
   ``show_dedicated_tab`` live so a missed hot-reload can't show a stale tab.
-* Signal handlers (``post_save`` / ``post_delete`` / ``m2m_changed``) defer
-  via ``transaction.on_commit`` and ultimately bump the local registry
-  version counter.
+* Signal handlers (``post_save`` / ``post_delete`` on ``CustomObjectType``)
+  defer via ``transaction.on_commit`` and ultimately advance the local
+  ``_last_seen_state`` snapshot via ``force_local_refresh()``.
+* ``refresh_if_stale()`` reads the ``(MAX(cache_timestamp), COUNT(*))`` token
+  and refreshes only when the snapshot drifts.
 
 These unit tests catch regressions at the function level so a breaking
 change shows up in CI before manual smoke.
 """
 
+from core.models import ObjectType
 from django.contrib.contenttypes.models import ContentType
-from django.db.models.signals import m2m_changed, post_save
+from django.db.models.signals import post_save
 from django.test import TestCase, TransactionTestCase
 from extras.choices import CustomFieldTypeChoices
 
@@ -28,8 +31,9 @@ from dcim.models import Site
 
 from netbox_custom_objects.models import CustomObjectType, CustomObjectTypeField
 from netbox_custom_objects.related_tabs import (
-    _REDIS_KEY,
+    _compute_state,
     refresh_if_stale,
+    seed_local_state,
 )
 from netbox_custom_objects.related_tabs.registry import (
     _COMBINED_NAME,
@@ -51,19 +55,21 @@ class DiscoveryTests(TransactionCleanupMixin, CustomObjectsTestCase, Transaction
             slug='disc-test-a',
             verbose_name_plural='Disc Test As',
         )
-        site_ct = ContentType.objects.get_for_model(Site)
+        # related_object_type is a FK to core.ObjectType (a strict subclass of
+        # ContentType in NetBox); a plain ContentType instance is rejected.
+        site_ot = ObjectType.objects.get_for_model(Site)
         CustomObjectTypeField.objects.create(
             custom_object_type=cot,
             name='related_site',
             label='Related Site',
             type=CustomFieldTypeChoices.TYPE_OBJECT,
             is_polymorphic=False,
-            related_object_type=site_ct,
+            related_object_type=site_ot,
         )
 
         ct_ids = _discover_target_content_type_ids()
 
-        self.assertIn(site_ct.pk, ct_ids)
+        self.assertIn(site_ot.pk, ct_ids)
 
     def test_polymorphic_targets_are_discovered(self):
         cot = CustomObjectType.objects.create(
@@ -71,7 +77,7 @@ class DiscoveryTests(TransactionCleanupMixin, CustomObjectsTestCase, Transaction
             slug='disc-test-b',
             verbose_name_plural='Disc Test Bs',
         )
-        site_ct = ContentType.objects.get_for_model(Site)
+        site_ot = ObjectType.objects.get_for_model(Site)
         # Use site as the only poly target; verifies the M2M code path
         # without requiring a second host model to exist in test fixtures.
         field = CustomObjectTypeField.objects.create(
@@ -81,11 +87,11 @@ class DiscoveryTests(TransactionCleanupMixin, CustomObjectsTestCase, Transaction
             type=CustomFieldTypeChoices.TYPE_OBJECT,
             is_polymorphic=True,
         )
-        field.related_object_types.set([site_ct])
+        field.related_object_types.set([site_ot])
 
         ct_ids = _discover_target_content_type_ids()
 
-        self.assertIn(site_ct.pk, ct_ids)
+        self.assertIn(site_ot.pk, ct_ids)
 
     def test_no_fields_yields_no_targets(self):
         # Any pre-existing COT fields from other test runs are isolated by
@@ -219,12 +225,12 @@ class ViewTabVisibleTests(TransactionCleanupMixin, CustomObjectsTestCase, Transa
 
 
 class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
-    """Signals on COT + COTField + m2m_changed schedule force_local_refresh."""
+    """post_save / post_delete on CustomObjectType advance ``_last_seen_state``."""
 
-    def test_cot_save_triggers_local_version_bump(self):
+    def test_cot_save_advances_local_state(self):
         import netbox_custom_objects.related_tabs as rt
 
-        before = rt._tab_registry_version
+        before = rt._last_seen_state
         cot = CustomObjectType.objects.create(
             name='signal_test_save',
             slug='signal-test-save',
@@ -232,11 +238,37 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
         )
 
         # TransactionTestCase commits after each statement, so the
-        # on_commit callback should have fired.
-        self.assertGreater(rt._tab_registry_version, before)
+        # on_commit callback fired and ``force_local_refresh`` snapshotted.
+        self.assertNotEqual(rt._last_seen_state, before)
+        self.assertIsNotNone(rt._last_seen_state)
+        # Snapshot now reflects the row we just created.
         self.assertTrue(CustomObjectType.objects.filter(pk=cot.pk).exists())
+        self.assertEqual(rt._last_seen_state, _compute_state())
 
-    def test_m2m_changed_on_related_object_types_triggers_refresh(self):
+    def test_cot_delete_advances_local_state(self):
+        import netbox_custom_objects.related_tabs as rt
+
+        cot = CustomObjectType.objects.create(
+            name='signal_test_delete',
+            slug='signal-test-delete',
+            verbose_name_plural='Signal Test Deletes',
+        )
+        # Read snapshot taken from the post_save on_commit of the create above.
+        before = rt._last_seen_state
+        cot.delete()
+
+        # COUNT(*) decreased; snapshot must have advanced via post_delete -> force_local_refresh.
+        self.assertNotEqual(rt._last_seen_state, before)
+        self.assertEqual(rt._last_seen_state, _compute_state())
+
+    def test_m2m_changed_on_related_object_types_advances_state(self):
+        """
+        Adding a ContentType to a polymorphic field's ``related_object_types``
+        must advance the snapshot.  Coverage comes from the ``models.py``
+        ``bump_cot_cache_timestamp_on_m2m_change`` receiver (which bumps the
+        parent COT's cache_timestamp) and the COT post_save handler (which
+        schedules force_local_refresh).
+        """
         import netbox_custom_objects.related_tabs as rt
 
         cot = CustomObjectType.objects.create(
@@ -252,12 +284,13 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
             is_polymorphic=True,
         )
 
-        before = rt._tab_registry_version
-        site_ct = ContentType.objects.get_for_model(Site)
-        field.related_object_types.add(site_ct)
+        before = rt._last_seen_state
+        site_ot = ObjectType.objects.get_for_model(Site)
+        field.related_object_types.add(site_ot)
 
         # on_commit fires after the M2M add commits.
-        self.assertGreater(rt._tab_registry_version, before)
+        self.assertNotEqual(rt._last_seen_state, before)
+        self.assertEqual(rt._last_seen_state, _compute_state())
 
     def test_dispatch_uids_idempotent(self):
         """Connect signals twice — should not duplicate registrations."""
@@ -266,15 +299,12 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
 
         uids = {
             'related_tabs_refresh_on_save_cot',
-            'related_tabs_refresh_on_save_cotfield',
             'related_tabs_refresh_on_delete_cot',
-            'related_tabs_refresh_on_delete_cotfield',
-            'related_tabs_refresh_on_cotfield_related_object_types_changed',
         }
 
         def _count_with_uids():
             count = 0
-            for signal in (post_save, post_delete, m2m_changed):
+            for signal in (post_save, post_delete):
                 for entry in signal.receivers:
                     # When dispatch_uid is provided, Django uses it directly
                     # as lookup_key[0] — a plain string, not a hash.
@@ -295,27 +325,52 @@ class SignalRefreshTests(TransactionCleanupMixin, CustomObjectsTestCase, Transac
 
 
 class RefreshIfStaleTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
-    """``refresh_if_stale()`` is a no-op when local == remote and refreshes when behind."""
+    """``refresh_if_stale()`` is a no-op when in-sync and refreshes when the DB token drifts."""
 
     def setUp(self):
         super().setUp()
-        from django.core.cache import cache
-
         import netbox_custom_objects.related_tabs as rt
 
-        cache.set(_REDIS_KEY, 1, timeout=None)
-        rt._tab_registry_version = 1
+        # Force this process's snapshot to the current DB state so the
+        # remaining assertions exercise the drift detection, not the
+        # initial sentinel-vs-DB miss.
+        rt._last_seen_state = _compute_state()
 
-    def test_no_op_when_versions_match(self):
-        # Should return False (didn't refresh).
+    def test_no_op_when_state_matches(self):
         self.assertFalse(refresh_if_stale())
 
-    def test_refresh_runs_when_local_behind(self):
-        from django.core.cache import cache
-
+    def test_refresh_runs_when_state_drifts(self):
         import netbox_custom_objects.related_tabs as rt
 
-        cache.set(_REDIS_KEY, rt._tab_registry_version + 5, timeout=None)
+        # Mutate the DB so MAX(cache_timestamp) and/or COUNT(*) changes.
+        # CustomObjectType.objects.create() bumps cache_timestamp via auto_now
+        # and increments COUNT — but the post_save handler also re-snapshots,
+        # so to test the drift-detection path we reset _last_seen_state to a
+        # known-stale value before invoking refresh_if_stale().
+        CustomObjectType.objects.create(
+            name='refresh_test',
+            slug='refresh-test',
+            verbose_name_plural='Refresh Tests',
+        )
+        rt._last_seen_state = (None, 0)  # deliberately stale sentinel
+
         self.assertTrue(refresh_if_stale())
-        # After refresh, local catches up to remote.
-        self.assertEqual(rt._tab_registry_version, rt._get_remote_version())
+        # After refresh, local catches up to current DB state.
+        self.assertEqual(rt._last_seen_state, _compute_state())
+
+    def test_seed_local_state_makes_refresh_a_noop(self):
+        """``seed_local_state()`` snapshots current DB, so the next refresh is a no-op."""
+        import netbox_custom_objects.related_tabs as rt
+
+        # Mutate then reset the local snapshot to None (mimicking fresh
+        # worker start) then call seed_local_state — refresh_if_stale should
+        # then return False without re-running _do_refresh.
+        CustomObjectType.objects.create(
+            name='seed_test',
+            slug='seed-test',
+            verbose_name_plural='Seed Tests',
+        )
+        rt._last_seen_state = None
+        seed_local_state()
+        self.assertEqual(rt._last_seen_state, _compute_state())
+        self.assertFalse(refresh_if_stale())
