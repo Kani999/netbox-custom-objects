@@ -9,12 +9,11 @@ from django.shortcuts import get_object_or_404, render
 from django.urls import NoReverseMatch, reverse
 from django.views.generic import View
 from extras.choices import CustomFieldTypeChoices, CustomFieldUIVisibleChoices
-from netbox.forms import NetBoxModelFilterSetForm
 from netbox_custom_objects import field_types
+from netbox_custom_objects.dynamic_forms import build_filterset_form_class
 from netbox_custom_objects.filtersets import get_filterset_class
 from netbox_custom_objects.models import CustomObjectTypeField
 from netbox_custom_objects.tables import CustomObjectTable
-from utilities.forms.fields import TagFilterField
 from utilities.views import ConditionalLoginRequiredMixin, ViewTab
 
 from ._co_common import (
@@ -97,31 +96,6 @@ def _build_typed_table_class(custom_object_type, dynamic_model):
     return type(
         f'{dynamic_model._meta.object_name}Table',
         (CustomObjectTable,),
-        attrs,
-    )
-
-
-def _build_filterset_form(custom_object_type, dynamic_model):
-    """
-    Dynamically build a filterset form class for a Custom Object Type.
-    Replicates CustomObjectListView.get_filterset_form() logic.
-    """
-    attrs = {
-        'model': dynamic_model,
-        '__module__': 'database.filterset_forms',
-        'tag': TagFilterField(dynamic_model),
-    }
-
-    for field in custom_object_type.fields.all():
-        field_type = field_types.FIELD_TYPE_CLASS[field.type]()
-        try:
-            attrs[field.name] = field_type.get_filterform_field(field)
-        except NotImplementedError:
-            logger.debug('typed tab: %s filter field not supported', field.name)
-
-    return type(
-        f'{dynamic_model._meta.object_name}FilterForm',
-        (NetBoxModelFilterSetForm,),
         attrs,
     )
 
@@ -324,8 +298,9 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
             filterset = filterset_class(request.GET, queryset=base_qs)
             filtered_qs = filterset.qs
 
-            # Build filterset form for the filter sidebar
-            filterset_form_class = _build_filterset_form(cot, dynamic_model)
+            # Build filterset form for the filter sidebar (shared canonical builder —
+            # expands polymorphic fields into one filter per allowed target type)
+            filterset_form_class = build_filterset_form_class(dynamic_model)
             filter_form = filterset_form_class(request.GET)
 
             # Build table class and instantiate
