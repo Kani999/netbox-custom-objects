@@ -40,7 +40,7 @@ def reference_q(host_ct_id, host_pk, field_name, field_type, is_polymorphic, thr
     """
     Build a Q selecting custom-object rows whose ``field_name`` references the host
     object identified by (``host_ct_id``, ``host_pk``).  Single source of truth for
-    the four reference shapes shared by the combined and typed tab views:
+    the four reference shapes the combined tab view filters on:
 
       * OBJECT, non-polymorphic      -> ``{name}_id``
       * OBJECT, polymorphic          -> ``{name}_content_type_id`` + ``{name}_object_id``
@@ -78,9 +78,9 @@ def _register_tab_view(model_class, name, path, view_factory):
 
     Idempotent: if a tab with this ``name`` is already registered for the model,
     log and skip without building the view — this guards against the Django
-    autoreloader re-running registration and against hot-reload re-registration.
-    ``view_factory`` is a zero-arg callable so the (cheap but pointless) view-class
-    construction is skipped on the already-registered path.
+    autoreloader re-running registration.  ``view_factory`` is a zero-arg callable
+    so the (cheap but pointless) view-class construction is skipped on the
+    already-registered path.
 
     Returns True if the view was registered, False if it was skipped.
     """

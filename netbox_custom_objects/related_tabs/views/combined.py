@@ -333,9 +333,13 @@ def register_combined_tabs(model_classes, label, weight):
     Register a combined Custom Objects tab view for each model in the list.
     """
     for model_class in model_classes:
+        # Bind model_class as a default arg so the factory closes over THIS
+        # iteration's value, not the loop variable's final value.  (_register_tab_view
+        # invokes the factory synchronously, so late binding wouldn't bite today —
+        # but this keeps the factory correct if it is ever deferred.)
         _register_tab_view(
             model_class,
             'custom_objects',
             'custom-objects',
-            lambda: _make_tab_view(model_class, label=label, weight=weight),
+            lambda model_class=model_class: _make_tab_view(model_class, label=label, weight=weight),
         )
