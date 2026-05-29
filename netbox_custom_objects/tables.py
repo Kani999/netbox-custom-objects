@@ -1,3 +1,4 @@
+import logging
 from urllib.parse import quote
 
 import django_tables2 as tables
@@ -6,13 +7,21 @@ from django.template import Context, Template
 from django.urls import reverse
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
+from extras.choices import CustomFieldTypeChoices, CustomFieldUIVisibleChoices
 from netbox.tables import NetBoxTable, columns
 from utilities.permissions import get_permission_for_model
 
 from netbox_custom_objects.models import CustomObject, CustomObjectType, CustomObjectTypeField
 from netbox_custom_objects.utilities import get_viewname
 
-__all__ = ("CustomObjectTable", "CustomObjectTypeFieldTable", "LinkedCustomObjectTable")
+logger = logging.getLogger("netbox_custom_objects.tables")
+
+__all__ = (
+    "CustomObjectTable",
+    "CustomObjectTypeFieldTable",
+    "LinkedCustomObjectTable",
+    "build_custom_object_table_class",
+)
 
 
 OBJECTCHANGE_FULL_NAME = """
@@ -308,3 +317,53 @@ class LinkedCustomObjectTable(NetBoxTable):
         model = CustomObjectTypeField
         fields = ("custom_object_type", "custom_object", "field")
         default_columns = ("custom_object_type", "custom_object", "field")
+
+
+def build_custom_object_table_class(custom_object_type, model):
+    """
+    Build a django-tables2 table class for a Custom Object Type's dynamic ``model``.
+
+    Columns are ``id`` plus each non-hidden field of ``custom_object_type`` (one
+    column per FieldType); the primary text/longtext field is linkified to the
+    object, and any field-specific ``render_<name>`` hook the FieldType defines is
+    wired in.  Single source of truth for ``CustomObjectTableMixin.get_table()``
+    (list / detail / bulk views) and the related-objects typed tab, so the two
+    stay in sync.
+    """
+    from netbox_custom_objects import field_types  # lazy: avoid a tables<-field_types import cycle at load
+
+    model_fields = custom_object_type.fields.all()
+    fields = ["id"] + [f.name for f in model_fields if f.ui_visible != CustomFieldUIVisibleChoices.HIDDEN]
+
+    meta = type(
+        "Meta",
+        (),
+        {
+            "model": model,
+            "fields": fields,
+            "attrs": {"class": "table table-hover object-list"},
+        },
+    )
+
+    attrs = {"Meta": meta, "__module__": "database.tables"}
+    linkable_field_types = (CustomFieldTypeChoices.TYPE_TEXT, CustomFieldTypeChoices.TYPE_LONGTEXT)
+
+    for field in model_fields:
+        if field.ui_visible == CustomFieldUIVisibleChoices.HIDDEN:
+            continue
+        field_type = field_types.FIELD_TYPE_CLASS[field.type]()
+        try:
+            attrs[field.name] = field_type.get_table_column_field(field)
+        except NotImplementedError:
+            logger.debug("build_custom_object_table_class: %s field not implemented; using default column", field.name)
+        # Primary text-based field linkifies to the object; other fields may define
+        # a render_<name> hook on their FieldType (django-tables2 render_foo methods).
+        if field.primary and field.type in linkable_field_types:
+            attrs[f"render_{field.name}"] = field_type.render_table_column_linkified
+        else:
+            try:
+                attrs[f"render_{field.name}"] = field_type.render_table_column
+            except AttributeError:
+                pass
+
+    return type(f"{model._meta.object_name}Table", (CustomObjectTable,), attrs)

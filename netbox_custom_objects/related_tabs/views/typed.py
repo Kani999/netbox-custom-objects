@@ -8,12 +8,11 @@ from django.db.utils import OperationalError, ProgrammingError
 from django.shortcuts import get_object_or_404, render
 from django.urls import NoReverseMatch, reverse
 from django.views.generic import View
-from extras.choices import CustomFieldTypeChoices, CustomFieldUIVisibleChoices
-from netbox_custom_objects import field_types
+from extras.choices import CustomFieldTypeChoices
 from netbox_custom_objects.dynamic_forms import build_filterset_form_class
 from netbox_custom_objects.filtersets import get_filterset_class
 from netbox_custom_objects.models import CustomObjectTypeField
-from netbox_custom_objects.tables import CustomObjectTable
+from netbox_custom_objects.tables import build_custom_object_table_class
 from utilities.views import ConditionalLoginRequiredMixin, ViewTab
 
 from ._co_common import (
@@ -45,59 +44,6 @@ def _build_combined_q(host_ct_id, instance_pk, field_infos):
             q_filter |= q
             has_filter = True
     return q_filter if has_filter else None
-
-
-def _build_typed_table_class(custom_object_type, dynamic_model):
-    """
-    Dynamically build a django-tables2 table class for a Custom Object Type.
-    Replicates CustomObjectTableMixin.get_table() logic.
-    """
-    model_fields = custom_object_type.fields.all()
-    fields = ['id'] + [field.name for field in model_fields if field.ui_visible != CustomFieldUIVisibleChoices.HIDDEN]
-
-    meta = type(
-        'Meta',
-        (),
-        {
-            'model': dynamic_model,
-            'fields': fields,
-            'attrs': {
-                'class': 'table table-hover object-list',
-            },
-        },
-    )
-
-    attrs = {
-        'Meta': meta,
-        '__module__': 'database.tables',
-    }
-
-    for field in model_fields:
-        if field.ui_visible == CustomFieldUIVisibleChoices.HIDDEN:
-            continue
-        field_type = field_types.FIELD_TYPE_CLASS[field.type]()
-        try:
-            attrs[field.name] = field_type.get_table_column_field(field)
-        except NotImplementedError:
-            logger.debug('typed tab: %s field type not implemented; using default column', field.name)
-
-        linkable_field_types = [
-            CustomFieldTypeChoices.TYPE_TEXT,
-            CustomFieldTypeChoices.TYPE_LONGTEXT,
-        ]
-        if field.primary and field.type in linkable_field_types:
-            attrs[f'render_{field.name}'] = field_type.render_table_column_linkified
-        else:
-            try:
-                attrs[f'render_{field.name}'] = field_type.render_table_column
-            except AttributeError:
-                pass
-
-    return type(
-        f'{dynamic_model._meta.object_name}Table',
-        (CustomObjectTable,),
-        attrs,
-    )
 
 
 def _build_add_links(custom_object_type_slug, host_instance, field_infos, return_url):
@@ -303,8 +249,8 @@ def _make_typed_tab_view(model_class, custom_object_type, field_infos, weight, h
             filterset_form_class = build_filterset_form_class(dynamic_model)
             filter_form = filterset_form_class(request.GET)
 
-            # Build table class and instantiate
-            table_class = _build_typed_table_class(cot, dynamic_model)
+            # Build table class and instantiate (shared builder — see tables.py)
+            table_class = build_custom_object_table_class(cot, dynamic_model)
             table = table_class(filtered_qs)
             table.columns.show('pk')
 
