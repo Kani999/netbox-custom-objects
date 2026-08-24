@@ -20,7 +20,7 @@ from netbox_custom_objects.models import CustomObjectTypeField
 from netbox_custom_objects.utilities import restrict_to_viewable
 from utilities.htmx import htmx_partial
 from utilities.paginator import EnhancedPaginator, get_paginate_count
-from utilities.views import ConditionalLoginRequiredMixin, ViewTab, register_model_view
+from utilities.views import ConditionalLoginRequiredMixin, ViewTab, get_default_template, register_model_view
 
 logger = logging.getLogger('netbox_custom_objects.related_tabs')
 
@@ -37,7 +37,10 @@ def _get_base_template(instance):
     """Return the correct base_template for an object's detail page."""
     if instance._meta.app_label == _CUSTOM_OBJECTS_APP:
         return _CO_BASE_TEMPLATE
-    return f'{instance._meta.app_label}/{instance._meta.model_name}.html'
+    # Not every model has an "{app}/{model}.html" detail template (e.g. ipam/vrf.html and
+    # dcim/macaddress.html don't exist). get_default_template falls back to
+    # generic/object.html — the same resolution NetBox's Journal/Changelog tabs use.
+    return get_default_template(instance._meta.model)
 
 
 def _restrict_or_warn(qs, user, *, label):
